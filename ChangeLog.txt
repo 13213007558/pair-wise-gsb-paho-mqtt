@@ -1,3 +1,12 @@
+Unreleased
+==========
+
+- Honor the Receive Maximum advertised by the server in MQTT v5 CONNACK when
+  scheduling outgoing QoS 1/2 publishes. The effective inflight limit is now
+  the minimum of max_inflight_messages and the server Receive Maximum.
+- Handle PUBREC with a failure reason code: the QoS 2 flow is aborted, no
+  PUBREL is sent and the inflight slot is released.
+
 v2.1.0 - 2024-04-29
 ===================
 

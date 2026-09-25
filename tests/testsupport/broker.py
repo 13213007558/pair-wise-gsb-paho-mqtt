@@ -55,6 +55,12 @@ class FakeBroker:
             except OSError:
               pass
 
+    def drop_connection(self):
+        """Close the current client connection, but keep accepting new ones."""
+        if self._conn is not None:
+            self._conn.close()
+            self._conn = None
+
     def receive_packet(self, num_bytes):
         if self._conn is None:
             raise ValueError('Connection is not open')
@@ -76,6 +82,13 @@ class FakeBroker:
             raise ValueError('Connection is not open')
 
         paho_test.expect_packet(self._conn, name, packet)
+
+    def expect_no_packet(self, delay=1):
+        """Expect that no packet is received within the given delay."""
+        if self._conn is None:
+            raise ValueError('Connection is not open')
+
+        paho_test.expect_no_packet(self._conn, delay)
 
 
 @pytest.fixture(params=["tcp"] + (["unix"] if hasattr(socket, 'AF_UNIX') else []))

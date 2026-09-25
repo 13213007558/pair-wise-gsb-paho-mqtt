@@ -843,6 +843,9 @@ class Client:
         self._max_inflight_messages = 20
         self._inflight_messages = 0
         self._max_queued_messages = 0
+        # Receive Maximum sent by the server in CONNACK (MQTT v5 only).
+        # 0 means the server didn't send any Receive Maximum.
+        self._receive_maximum = 0
         self._connect_properties: Properties | None = None
         self._will_properties: Properties | None = None
         self._will = False
@@ -1039,6 +1042,9 @@ class Client:
     def max_inflight_messages(self) -> int:
         """
         Maximum number of messages with QoS > 0 that can be partway through the network flow at once
+
+        When using MQTT v5, the effective limit is the minimum of this value
+        and the Receive Maximum sent by the server in CONNACK, if any.
 
         This property may not be changed if the connection is already open.
         """
@@ -1823,7 +1829,8 @@ class Client:
                     return message.info
 
                 self._out_messages[message.mid] = message
-                if self._max_inflight_messages == 0 or self._inflight_messages < self._max_inflight_messages:
+                max_inflight = self._inflight_send_quota()
+                if max_inflight == 0 or self._inflight_messages < max_inflight:
                     self._inflight_messages += 1
                     if qos == 1:
                         message.state = mqtt_ms_wait_for_puback
@@ -3898,6 +3905,13 @@ class Client:
                     # CONNACK, the client must use that value instead of the one
                     # it sent (MQTT 5.0 spec 3.2.2.3.14).
                     self._keepalive = properties.ServerKeepAlive
+                if result == 0:
+                    # MQTT 5.0: the Receive Maximum applies to the current
+                    # connection only. If absent, there is no server limit.
+                    if hasattr(properties, "ReceiveMaximum"):
+                        self._receive_maximum = properties.ReceiveMaximum
+                    else:
+                        self._receive_maximum = 0
         else:
             (flags, result) = struct.unpack("!BB", self._in_packet['packet'])
             reason = convert_connack_rc_to_reason_code(result)
@@ -3992,6 +4006,16 @@ class Client:
                     if m.state == mqtt_ms_queued:
                         self.loop_write()  # Process outgoing messages that have just been queued up
                         return MQTT_ERR_SUCCESS
+
+                    if m.qos > 0 and m.state == mqtt_ms_publish:
+                        max_inflight = self._inflight_send_quota()
+                        if max_inflight > 0 and self._inflight_messages >= max_inflight:
+                            # The inflight limit (local max_inflight_messages or
+                            # the server Receive Maximum) is reached: keep this
+                            # message queued, _update_inflight() will send it
+                            # when a slot is released.
+                            m.state = mqtt_ms_queued
+                            continue
 
                     if m.qos == 0:
                         with self._in_callback_mutex:  # Don't call loop_write after _send_publish()
@@ -4264,7 +4288,7 @@ class Client:
                 # prevents multiple callbacks for the same message.
                 message = self._in_messages.pop(mid)
                 self._handle_on_message(message)
-                if self._max_inflight_messages > 0:
+                if self._inflight_send_quota() > 0:
                     with self._out_message_mutex:
                         rc = self._update_inflight()
                     if rc != MQTTErrorCode.MQTT_ERR_SUCCESS:
@@ -4281,10 +4305,22 @@ class Client:
         else:
             return self._send_pubcomp(mid)
 
+    def _inflight_send_quota(self) -> int:
+        # Effective limit of in-flight QoS 1/2 PUBLISH packets: the most
+        # restrictive of the local max_inflight_messages and the Receive
+        # Maximum sent by the server in CONNACK (MQTT v5 only).
+        # A value of 0 means no limit.
+        if self._max_inflight_messages == 0:
+            return self._receive_maximum
+        if self._receive_maximum == 0:
+            return self._max_inflight_messages
+        return min(self._max_inflight_messages, self._receive_maximum)
+
     def _update_inflight(self) -> MQTTErrorCode:
         # Dont lock message_mutex here
+        max_inflight = self._inflight_send_quota()
         for m in self._out_messages.values():
-            if self._inflight_messages < self._max_inflight_messages:
+            if max_inflight == 0 or self._inflight_messages < max_inflight:
                 if m.qos > 0 and m.state == mqtt_ms_queued:
                     self._inflight_messages += 1
                     if m.qos == 1:
@@ -4314,18 +4350,23 @@ class Client:
             return MQTTErrorCode.MQTT_ERR_PROTOCOL
 
         mid, = struct.unpack("!H", self._in_packet['packet'][:2])
+        reasonCode = ReasonCode(PUBREC >> 4)
+        properties = Properties(PUBREC >> 4)
         if self._protocol == MQTTv5:
             if self._in_packet['remaining_length'] > 2:
-                reasonCode = ReasonCode(PUBREC >> 4)
                 reasonCode.unpack(self._in_packet['packet'][2:])
                 if self._in_packet['remaining_length'] > 3:
-                    properties = Properties(PUBREC >> 4)
                     _props, _props_len = properties.unpack(
                         self._in_packet['packet'][3:])
         self._easy_log(MQTT_LOG_DEBUG, "Received PUBREC (Mid: %d)", mid)
 
         with self._out_message_mutex:
             if mid in self._out_messages:
+                if self._protocol == MQTTv5 and reasonCode.is_failure:
+                    # The QoS 2 exchange is aborted by the receiver: the
+                    # message won't be delivered, no PUBREL must be sent and
+                    # the inflight slot is released (MQTT 5.0 spec 4.9).
+                    return self._do_on_publish(mid, reasonCode, properties)
                 msg = self._out_messages[mid]
                 msg.state = mqtt_ms_wait_for_pubcomp
                 msg.timestamp = time_func()
@@ -4483,7 +4524,7 @@ class Client:
         msg.info._set_as_published()
         if msg.qos > 0:
             self._inflight_messages -= 1
-            if self._max_inflight_messages > 0:
+            if self._inflight_send_quota() > 0:
                 rc = self._update_inflight()
                 if rc != MQTTErrorCode.MQTT_ERR_SUCCESS:
                     return rc

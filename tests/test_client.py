@@ -303,6 +303,238 @@ class Test_connect_v5:
             mqttc.loop_stop()
 
 
+class TestReceiveMaximum:
+    """
+    Tests that the client honors the Receive Maximum advertised by the
+    server in CONNACK (MQTT v5) when scheduling outgoing QoS 1/2 publishes.
+    """
+
+    @staticmethod
+    def _gen_connack(receive_maximum):
+        properties = mqtt5_props.gen_uint16_prop(
+            mqtt5_props.PROP_RECEIVE_MAXIMUM, receive_maximum)
+        return paho_test.gen_connack(
+            rc=0, proto_ver=MQTTProtocolVersion.MQTTv5,
+            properties=properties, property_helper=False)
+
+    @staticmethod
+    def _gen_publish(mid, qos, dup=False):
+        return paho_test.gen_publish(
+            f"topic/{mid}", qos=qos, payload=f"payload-{mid}",
+            mid=mid, dup=dup, proto_ver=MQTTProtocolVersion.MQTTv5)
+
+    def _connect_client(self, client_id, fake_broker, receive_maximum, clean_session=True):
+        mqttc = client.Client(
+            CallbackAPIVersion.VERSION2,
+            client_id,
+            protocol=MQTTProtocolVersion.MQTTv5,
+            transport=fake_broker.transport,
+        )
+        on_connect_reached = threading.Event()
+
+        def on_connect(mqttc, obj, flags, reason, properties):
+            on_connect_reached.set()
+
+        mqttc.on_connect = on_connect
+        mqttc.connect_async("localhost", fake_broker.port)
+        mqttc.loop_start()
+
+        fake_broker.start()
+        connect_packet = paho_test.gen_connect(
+            client_id, keepalive=60, clean_session=clean_session,
+            proto_ver=MQTTProtocolVersion.MQTTv5)
+        packet_in = fake_broker.receive_packet(1000)
+        assert packet_in  # Check connection was not closed
+        assert packet_in == connect_packet
+
+        connack_packet = self._gen_connack(receive_maximum)
+        count = fake_broker.send_packet(connack_packet)
+        assert count  # Check connection was not closed
+        assert count == len(connack_packet)
+
+        assert on_connect_reached.wait(1)
+        return mqttc
+
+    def test_qos1_limited_by_receive_maximum(self, fake_broker: FakeBroker):
+        mqttc = self._connect_client("receive-maximum-qos1", fake_broker, 2)
+        try:
+            # The local limit is much higher than the server Receive Maximum
+            assert mqttc.max_inflight_messages == 20
+
+            infos = [mqttc.publish(f"topic/{i}", f"payload-{i}", qos=1) for i in (1, 2, 3, 4)]
+            # Packet ids are allocated even for messages that can't be sent yet
+            assert [info.mid for info in infos] == [1, 2, 3, 4]
+
+            # Only Receive Maximum QoS 1 publishes are sent, in order
+            fake_broker.expect_packet("publish 1", self._gen_publish(1, qos=1))
+            fake_broker.expect_packet("publish 2", self._gen_publish(2, qos=1))
+            fake_broker.expect_no_packet(delay=0.5)
+
+            # Each PUBACK releases exactly one slot
+            fake_broker.send_packet(paho_test.gen_puback(1, proto_ver=MQTTProtocolVersion.MQTTv5))
+            fake_broker.expect_packet("publish 3", self._gen_publish(3, qos=1))
+            fake_broker.expect_no_packet(delay=0.5)
+
+            fake_broker.send_packet(paho_test.gen_puback(2, proto_ver=MQTTProtocolVersion.MQTTv5))
+            fake_broker.expect_packet("publish 4", self._gen_publish(4, qos=1))
+
+            fake_broker.send_packet(paho_test.gen_puback(3, proto_ver=MQTTProtocolVersion.MQTTv5))
+            fake_broker.send_packet(paho_test.gen_puback(4, proto_ver=MQTTProtocolVersion.MQTTv5))
+            for info in infos:
+                info.wait_for_publish(1)
+                assert info.is_published()
+        finally:
+            mqttc.loop_stop()
+
+    def test_qos2_slot_released_on_pubcomp_not_pubrec(self, fake_broker: FakeBroker):
+        mqttc = self._connect_client("receive-maximum-qos2", fake_broker, 2)
+        try:
+            infos = [mqttc.publish(f"topic/{i}", f"payload-{i}", qos=2) for i in (1, 2, 3)]
+
+            fake_broker.expect_packet("publish 1", self._gen_publish(1, qos=2))
+            fake_broker.expect_packet("publish 2", self._gen_publish(2, qos=2))
+            fake_broker.expect_no_packet(delay=0.5)
+
+            # A successful PUBREC moves the flow forward (PUBREL) but does
+            # NOT release the inflight slot: no third PUBLISH is sent yet.
+            fake_broker.send_packet(paho_test.gen_pubrec(1, proto_ver=MQTTProtocolVersion.MQTTv5))
+            fake_broker.expect_packet("pubrel 1", paho_test.gen_pubrel(1, proto_ver=MQTTProtocolVersion.MQTTv5))
+            fake_broker.expect_no_packet(delay=0.5)
+
+            # The slot is released on PUBCOMP.
+            fake_broker.send_packet(paho_test.gen_pubcomp(1, proto_ver=MQTTProtocolVersion.MQTTv5))
+            fake_broker.expect_packet("publish 3", self._gen_publish(3, qos=2))
+
+            fake_broker.send_packet(paho_test.gen_pubrec(2, proto_ver=MQTTProtocolVersion.MQTTv5))
+            fake_broker.expect_packet("pubrel 2", paho_test.gen_pubrel(2, proto_ver=MQTTProtocolVersion.MQTTv5))
+            fake_broker.send_packet(paho_test.gen_pubrec(3, proto_ver=MQTTProtocolVersion.MQTTv5))
+            fake_broker.expect_packet("pubrel 3", paho_test.gen_pubrel(3, proto_ver=MQTTProtocolVersion.MQTTv5))
+            fake_broker.send_packet(paho_test.gen_pubcomp(2, proto_ver=MQTTProtocolVersion.MQTTv5))
+            fake_broker.send_packet(paho_test.gen_pubcomp(3, proto_ver=MQTTProtocolVersion.MQTTv5))
+            for info in infos:
+                info.wait_for_publish(1)
+                assert info.is_published()
+        finally:
+            mqttc.loop_stop()
+
+    def test_qos0_does_not_consume_slots(self, fake_broker: FakeBroker):
+        mqttc = self._connect_client("receive-maximum-qos0", fake_broker, 2)
+        try:
+            info1 = mqttc.publish("topic/1", "payload-1", qos=1)
+            info2 = mqttc.publish("topic/2", "payload-2", qos=1)
+            info0 = mqttc.publish("topic/0", "payload-0", qos=0)
+            info3 = mqttc.publish("topic/3", "payload-3", qos=1)
+            # The QoS 0 publish also allocated a packet id
+            assert (info1.mid, info2.mid, info0.mid, info3.mid) == (1, 2, 3, 4)
+
+            fake_broker.expect_packet("publish 1", self._gen_publish(1, qos=1))
+            fake_broker.expect_packet("publish 2", self._gen_publish(2, qos=1))
+            # QoS 0 doesn't use an inflight slot and is sent immediately
+            fake_broker.expect_packet("publish qos0", paho_test.gen_publish(
+                "topic/0", qos=0, payload="payload-0",
+                proto_ver=MQTTProtocolVersion.MQTTv5))
+            fake_broker.expect_no_packet(delay=0.5)
+
+            fake_broker.send_packet(paho_test.gen_puback(1, proto_ver=MQTTProtocolVersion.MQTTv5))
+            fake_broker.expect_packet("publish 3", paho_test.gen_publish(
+                "topic/3", qos=1, payload="payload-3", mid=4,
+                proto_ver=MQTTProtocolVersion.MQTTv5))
+            fake_broker.send_packet(paho_test.gen_puback(2, proto_ver=MQTTProtocolVersion.MQTTv5))
+            fake_broker.send_packet(paho_test.gen_puback(4, proto_ver=MQTTProtocolVersion.MQTTv5))
+            for info in (info1, info2, info0, info3):
+                info.wait_for_publish(1)
+                assert info.is_published()
+        finally:
+            mqttc.loop_stop()
+
+    def test_qos2_failed_pubrec_releases_slot(self, fake_broker: FakeBroker):
+        mqttc = self._connect_client("receive-maximum-pubrec-failure", fake_broker, 2)
+        published = []
+
+        def on_publish(mqttc, obj, mid, reason_code, properties):
+            published.append((mid, reason_code))
+
+        mqttc.on_publish = on_publish
+        try:
+            info1 = mqttc.publish("topic/1", "payload-1", qos=2)
+            mqttc.publish("topic/2", "payload-2", qos=2)
+            mqttc.publish("topic/3", "payload-3", qos=1)
+
+            fake_broker.expect_packet("publish 1", self._gen_publish(1, qos=2))
+            fake_broker.expect_packet("publish 2", self._gen_publish(2, qos=2))
+            fake_broker.expect_no_packet(delay=0.5)
+
+            # A PUBREC with a failure reason code aborts the QoS 2 flow: no
+            # PUBREL is sent and the inflight slot is released immediately.
+            fake_broker.send_packet(paho_test.gen_pubrec(
+                1, proto_ver=MQTTProtocolVersion.MQTTv5, reason_code=0x80))
+            fake_broker.expect_packet("publish 3", self._gen_publish(3, qos=1))
+            fake_broker.expect_no_packet(delay=0.5)
+
+            assert published == [(1, ReasonCode(client.PUBREC >> 4, "Unspecified error"))]
+            assert published[0][1].is_failure
+            info1.wait_for_publish(1)
+            assert info1.is_published()
+
+            fake_broker.send_packet(paho_test.gen_pubrec(2, proto_ver=MQTTProtocolVersion.MQTTv5))
+            fake_broker.expect_packet("pubrel 2", paho_test.gen_pubrel(2, proto_ver=MQTTProtocolVersion.MQTTv5))
+            fake_broker.send_packet(paho_test.gen_pubcomp(2, proto_ver=MQTTProtocolVersion.MQTTv5))
+            fake_broker.send_packet(paho_test.gen_puback(3, proto_ver=MQTTProtocolVersion.MQTTv5))
+        finally:
+            mqttc.loop_stop()
+
+    def test_reconnect_with_smaller_receive_maximum(self, fake_broker: FakeBroker):
+        mqttc = self._connect_client("receive-maximum-reconnect", fake_broker, 20)
+        on_disconnect_reached = threading.Event()
+
+        def on_disconnect(*args):
+            on_disconnect_reached.set()
+
+        mqttc.on_disconnect = on_disconnect
+        try:
+            infos = [mqttc.publish(f"topic/{i}", f"payload-{i}", qos=1) for i in (1, 2, 3)]
+            for mid in (1, 2, 3):
+                fake_broker.expect_packet(f"publish {mid}", self._gen_publish(mid, qos=1))
+
+            # Connection is lost before any PUBACK: all three messages
+            # become in-flight again on the next connection.
+            fake_broker.drop_connection()
+            assert on_disconnect_reached.wait(2)
+
+            fake_broker.start()
+            connect_packet = paho_test.gen_connect(
+                "receive-maximum-reconnect", keepalive=60, clean_session=False,
+                proto_ver=MQTTProtocolVersion.MQTTv5)
+            packet_in = fake_broker.receive_packet(1000)
+            assert packet_in  # Check connection was not closed
+            assert packet_in == connect_packet
+
+            # The server now advertises a smaller Receive Maximum.
+            connack_packet = self._gen_connack(1)
+            count = fake_broker.send_packet(connack_packet)
+            assert count  # Check connection was not closed
+            assert count == len(connack_packet)
+
+            # The restored in-flight messages count toward the new limit:
+            # only one (duplicated) PUBLISH is sent at a time.
+            fake_broker.expect_packet("publish 1", self._gen_publish(1, qos=1, dup=True))
+            fake_broker.expect_no_packet(delay=0.5)
+
+            fake_broker.send_packet(paho_test.gen_puback(1, proto_ver=MQTTProtocolVersion.MQTTv5))
+            fake_broker.expect_packet("publish 2", self._gen_publish(2, qos=1, dup=True))
+            fake_broker.expect_no_packet(delay=0.5)
+
+            fake_broker.send_packet(paho_test.gen_puback(2, proto_ver=MQTTProtocolVersion.MQTTv5))
+            fake_broker.expect_packet("publish 3", self._gen_publish(3, qos=1, dup=True))
+
+            fake_broker.send_packet(paho_test.gen_puback(3, proto_ver=MQTTProtocolVersion.MQTTv5))
+            for info in infos:
+                info.wait_for_publish(1)
+                assert info.is_published()
+        finally:
+            mqttc.loop_stop()
+
+
 class TestConnectionLost:
     def test_with_loop_start(self, fake_broker: FakeBroker):
         mqttc = client.Client(
