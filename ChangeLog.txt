@@ -1,3 +1,14 @@
+v2.2.0 - unreleased
+===================
+
+- Add support for MQTT v5 topic aliases. The client manages topic aliases
+  per connection: it automatically assigns and re-uses aliases when
+  publishing (if the server advertised a Topic Alias Maximum), resolves
+  aliases received from the server so callbacks always see the real topic,
+  rejects invalid alias references with a DISCONNECT (reason "Topic alias
+  invalid"), and resets all aliases on reconnect so re-sent QoS messages
+  always carry the full topic of the new connection.
+
 v2.1.0 - 2024-04-29
 ===================
 

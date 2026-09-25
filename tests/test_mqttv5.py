@@ -1115,15 +1115,25 @@ class Test(_TestBase):
         laclient.connect(host="localhost", port=self._test_broker_port, clean_start=False,
                          properties=connect_properties)
 
-        laclient.publish(topics[0], b"topic alias 3", 1)
-        lacallback.messages.get(timeout=DEFAULT_TIMEOUT)
-
         publish_properties = Properties(PacketTypes.PUBLISH)
         publish_properties.TopicAlias = 1
-        laclient.publish("", b"topic alias 4", 1,
-                         properties=publish_properties)
+        # the alias is unknown on this new connection, so an empty topic
+        # reference to it is rejected before it reaches the broker
+        self.assertRaises(
+            ValueError, laclient.publish, "", b"topic alias 3", 1,
+            properties=publish_properties)
 
-        # should get back a disconnect with Topic alias invalid
+        # re-establish the alias with a full topic, then the empty topic
+        # reference is valid again
+        laclient.publish(topics[0], b"topic alias 4", 1,
+                         properties=publish_properties)
+        lacallback.messages.get(timeout=DEFAULT_TIMEOUT)
+
+        laclient.publish("", b"topic alias 5", 1,
+                         properties=publish_properties)
+        lacallback.messages.get(timeout=DEFAULT_TIMEOUT)
+
+        laclient.disconnect()
         lacallback.wait_disconnected()
         laclient.loop_stop()
 
@@ -1157,13 +1167,15 @@ class Test(_TestBase):
         self.assertTrue(topicalias > 0)
         self.assertEqual(msgs[0]["message"].topic, topics[0])
 
+        # later messages only carry the alias, but the client resolves it
+        # so that callbacks always see the real topic
         self.assertEqual(
             msgs[1]["message"].properties.TopicAlias, topicalias)
-        self.assertEqual(msgs[1]["message"].topic, "")
+        self.assertEqual(msgs[1]["message"].topic, topics[0])
 
         self.assertEqual(
             msgs[2]["message"].properties.TopicAlias, topicalias)
-        self.assertEqual(msgs[2]["message"].topic, "")
+        self.assertEqual(msgs[2]["message"].topic, topics[0])
 
         serverTopicAliasMaximum = 0  # no server topic alias allowed
         connect_properties = Properties(PacketTypes.CONNECT)

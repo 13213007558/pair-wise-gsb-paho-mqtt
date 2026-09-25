@@ -12,14 +12,18 @@
 
 
 import tests.paho_test as paho_test
+from tests import mqtt5_props
 
 connect_packet = paho_test.gen_connect(
     "publish-helper-qos0-test", keepalive=60, proto_ver=5, properties=None
 )
 connack_packet = paho_test.gen_connack(rc=0, proto_ver=5)
 
+# the CONNACK advertises a Topic Alias Maximum, so the client assigns
+# alias 1 to the topic when publishing
 publish_packet = paho_test.gen_publish(
-    "pub/qos0/test", qos=0, payload="message", proto_ver=5
+    "pub/qos0/test", qos=0, payload="message", proto_ver=5,
+    properties=mqtt5_props.gen_uint16_prop(mqtt5_props.PROP_TOPIC_ALIAS, 1),
 )
 
 disconnect_packet = paho_test.gen_disconnect()
