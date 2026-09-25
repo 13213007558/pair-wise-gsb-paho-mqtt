@@ -845,6 +845,22 @@ class Client:
         self._max_queued_messages = 0
         self._connect_properties: Properties | None = None
         self._will_properties: Properties | None = None
+        # Automatic topic alias (MQTT v5) state. Aliases are only valid for
+        # the lifetime of a single network connection and are re-established
+        # from scratch on every (re)connect, even if the MQTT session lives on.
+        self._topic_alias_enabled = False
+        # Outgoing alias quota granted by the server in CONNACK
+        # (TopicAliasMaximum). 0 means "send full topics".
+        self._topic_alias_maximum = 0
+        self._topic_alias_mutex = threading.Lock()
+        self._topic_aliases: dict[bytes, int] = {}
+        self._alias_topics: dict[int, bytes] = {}
+        # Aliases bound by the application itself (Properties.TopicAlias);
+        # the automatic allocator never hands those out or evicts them.
+        self._manual_topic_aliases: set[int] = set()
+        # Automatically assigned aliases, alias -> topic, ordered by use
+        # (least recently used first) for deterministic eviction.
+        self._auto_alias_lru: collections.OrderedDict[int, bytes] = collections.OrderedDict()
         self._will = False
         self._will_topic = b""
         self._will_payload: bytes | bytearray = b""
@@ -1882,6 +1898,51 @@ class Client:
         be used to create a bridge between multiple broker.
         """
         self._client_mode = MQTT_BRIDGE
+
+    def enable_topic_alias(self) -> None:
+        """Enable automatic MQTT v5 topic aliases for outgoing publishes.
+
+        When enabled, and when the server grants a quota through the
+        TopicAliasMaximum property of CONNACK, the client transparently
+        replaces repeated long topic names with a short topic alias,
+        saving bytes on the wire. The first time a topic (or a reused
+        alias) is sent, the full topic name is always included so the
+        server can learn the mapping; later publishes of the same topic
+        carry only the alias.
+
+        Aliases are scoped to a single network connection: they are
+        discarded on every reconnect (even when the MQTT session is
+        resumed) and re-established on the new connection. QoS 1/2
+        retransmissions always resolve the alias against the current
+        connection mapping, so a re-sent message can never be delivered
+        to the wrong topic because its alias was re-bound in the meantime.
+
+        If the application sets Properties.TopicAlias manually on a
+        publish, the manual value always goes on the wire unchanged and
+        deterministically replaces any automatic binding of the same
+        alias; the automatic allocator never assigns an alias number the
+        application has bound itself on the current connection.
+
+        If the server grants no quota (TopicAliasMaximum of 0 or absent),
+        or for MQTT v3.x connections, publishes are sent with the full
+        topic as usual.
+        """
+        self._topic_alias_enabled = True
+
+    def disable_topic_alias(self) -> None:
+        """Disable automatic topic aliases and forget all current mappings."""
+        self._topic_alias_enabled = False
+        with self._topic_alias_mutex:
+            self._topic_aliases.clear()
+            self._alias_topics.clear()
+            self._manual_topic_aliases.clear()
+            self._auto_alias_lru.clear()
+
+    @property
+    def topic_alias_maximum(self) -> int:
+        """The outgoing topic alias quota granted by the server in the last
+        CONNACK (TopicAliasMaximum). 0 if no quota was granted."""
+        return self._topic_alias_maximum
 
     def _connection_closed(self) -> bool:
         """
@@ -3376,6 +3437,101 @@ class Client:
         self._easy_log(MQTT_LOG_DEBUG, "Sending PUBCOMP (Mid: %d)", mid)
         return self._send_command_with_mid(PUBCOMP, mid, False)
 
+    @staticmethod
+    def _copy_publish_properties(properties: Properties | None) -> Properties:
+        # Copy a PUBLISH Properties object so an automatically assigned
+        # TopicAlias never mutates the caller's object (which is kept in
+        # the outgoing message queue and reused on retransmission).
+        new_properties = Properties(PacketTypes.PUBLISH)
+        if properties is not None:
+            for name in properties.names:
+                compressed_name = name.replace(' ', '')
+                if hasattr(properties, compressed_name):
+                    object.__setattr__(
+                        new_properties, compressed_name,
+                        getattr(properties, compressed_name))
+        return new_properties
+
+    def _register_topic_alias(self, topic: bytes, alias: int, manual: bool) -> None:
+        # Must be called with self._topic_alias_mutex held.
+        old_topic = self._alias_topics.get(alias)
+        if old_topic is not None and old_topic != topic:
+            del self._topic_aliases[old_topic]
+        old_alias = self._topic_aliases.get(topic)
+        if old_alias is not None and old_alias != alias:
+            del self._alias_topics[old_alias]
+            self._manual_topic_aliases.discard(old_alias)
+            self._auto_alias_lru.pop(old_alias, None)
+        self._topic_aliases[topic] = alias
+        self._alias_topics[alias] = topic
+        if manual:
+            self._manual_topic_aliases.add(alias)
+            self._auto_alias_lru.pop(alias, None)
+        else:
+            self._manual_topic_aliases.discard(alias)
+            self._auto_alias_lru[alias] = topic
+
+    def _allocate_topic_alias(self) -> int | None:
+        # Must be called with self._topic_alias_mutex held.
+        # Prefer the lowest never-used alias number.
+        for alias in range(1, self._topic_alias_maximum + 1):
+            if alias not in self._alias_topics:
+                return alias
+        # All aliases are in use: deterministically rebind the least
+        # recently used automatically assigned alias. Aliases bound
+        # manually by the application are never evicted.
+        if self._auto_alias_lru:
+            alias, old_topic = next(iter(self._auto_alias_lru.items()))
+            del self._auto_alias_lru[alias]
+            del self._topic_aliases[old_topic]
+            del self._alias_topics[alias]
+            return alias
+        return None
+
+    def _apply_topic_alias(
+        self, topic: bytes, properties: Properties | None
+    ) -> tuple[bytes, Properties | None]:
+        # Resolve the topic/alias to put on the wire against the mapping
+        # of the *current* connection. Because this runs at packet build
+        # time, QoS 1/2 retransmissions can never reuse an alias that has
+        # been re-bound to another topic in the meantime.
+        manual_alias = None
+        if properties is not None and hasattr(properties, "TopicAlias"):
+            manual_alias = properties.TopicAlias
+
+        with self._topic_alias_mutex:
+            if manual_alias is not None:
+                # An application-provided alias always goes on the wire
+                # unchanged; if it carries a topic, record the binding so
+                # it deterministically replaces any automatic binding of
+                # the same alias and is never handed out automatically.
+                if topic:
+                    self._register_topic_alias(topic, manual_alias, manual=True)
+                return topic, properties
+
+            if not self._topic_alias_enabled or self._topic_alias_maximum <= 0 or not topic:
+                return topic, properties
+
+            alias = self._topic_aliases.get(topic)
+            if alias is not None:
+                # Known mapping: the topic may be omitted on the wire.
+                if alias in self._auto_alias_lru:
+                    self._auto_alias_lru.move_to_end(alias)
+                wire_topic = b""
+            else:
+                alias = self._allocate_topic_alias()
+                if alias is None:
+                    # Quota exhausted by application-bound aliases.
+                    return topic, properties
+                # First use of this alias (or a re-bind): the full topic
+                # must be sent together with the alias.
+                self._register_topic_alias(topic, alias, manual=False)
+                wire_topic = topic
+
+        new_properties = self._copy_publish_properties(properties)
+        new_properties.TopicAlias = alias
+        return wire_topic, new_properties
+
     def _pack_remaining_length(
         self, packet: bytearray, remaining_length: int
     ) -> bytearray:
@@ -3418,6 +3574,9 @@ class Client:
 
         if self._sock is None:
             return MQTTErrorCode.MQTT_ERR_NO_CONN
+
+        if self._protocol == MQTTv5:
+            topic, properties = self._apply_topic_alias(topic, properties)
 
         command = PUBLISH | ((dup & 0x1) << 3) | (qos << 1) | retain
         packet = bytearray()
@@ -3503,6 +3662,17 @@ class Client:
 
     def _send_connect(self, keepalive: int) -> MQTTErrorCode:
         proto_ver = int(self._protocol)
+
+        # Topic aliases only live for the duration of a network connection:
+        # forget all mappings and the granted quota on every (re)connect,
+        # even if the MQTT session itself is resumed.
+        self._topic_alias_maximum = 0
+        with self._topic_alias_mutex:
+            self._topic_aliases.clear()
+            self._alias_topics.clear()
+            self._manual_topic_aliases.clear()
+            self._auto_alias_lru.clear()
+
         # hard-coded UTF-8 encoded string
         protocol = b"MQTT" if proto_ver >= MQTTv311 else b"MQIsdp"
 
@@ -3898,6 +4068,10 @@ class Client:
                     # CONNACK, the client must use that value instead of the one
                     # it sent (MQTT 5.0 spec 3.2.2.3.14).
                     self._keepalive = properties.ServerKeepAlive
+                if hasattr(properties, "TopicAliasMaximum"):
+                    # MQTT 5.0: the maximum topic alias the server accepts
+                    # for publishes sent by this client on this connection.
+                    self._topic_alias_maximum = properties.TopicAliasMaximum
         else:
             (flags, result) = struct.unpack("!BB", self._in_packet['packet'])
             reason = convert_connack_rc_to_reason_code(result)

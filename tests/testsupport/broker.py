@@ -55,6 +55,13 @@ class FakeBroker:
             except OSError:
               pass
 
+    def drop_connection(self):
+        """Abruptly close the client connection while keeping the listening
+        socket open, so the client can reconnect (start() accepts again)."""
+        if self._conn is not None:
+            self._conn.close()
+            self._conn = None
+
     def receive_packet(self, num_bytes):
         if self._conn is None:
             raise ValueError('Connection is not open')
