@@ -45,6 +45,10 @@ def gen_string_prop(identifier, s):
     prop = struct.pack(f'!BH{len(s)}s', identifier, len(s), s)
     return prop
 
+def gen_binary_prop(identifier, data):
+    prop = struct.pack(f'!BH{len(data)}s', identifier, len(data), data)
+    return prop
+
 def gen_string_pair_prop(identifier, s1, s2):
     s1 = s1.encode("utf-8")
     s2 = s2.encode("utf-8")
@@ -73,4 +77,3 @@ def prop_finalise(props):
         return pack_varint(0)
     else:
         return pack_varint(len(props)) + props
-

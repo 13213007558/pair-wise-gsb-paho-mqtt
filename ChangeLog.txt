@@ -1,3 +1,15 @@
+Unreleased
+==========
+
+- Add support for MQTT v5.0 enhanced authentication (AUTH packet): new
+  auth_method_set(), authenticate() and re_authenticate() methods and a new
+  on_auth callback. The authentication method is enforced for the lifetime of
+  a connection and re-authentication is supported on established connections.
+- Fix DISCONNECT packets received with a reason code but no properties being
+  reported as "Normal disconnection" instead of their actual reason code.
+- Report the reason code of a client-sent DISCONNECT to the on_disconnect
+  callback (callback API version 2).
+
 v2.1.0 - 2024-04-29
 ===================
 

@@ -95,6 +95,12 @@ class _ConnectionState(enum.Enum):
     MQTT_CS_DISCONNECTED = enum.auto()
 
 
+class _AuthState(enum.Enum):
+    MQTT_AUTH_IDLE = enum.auto()
+    MQTT_AUTH_IN_PROGRESS = enum.auto()
+    MQTT_AUTH_REAUTHENTICATING = enum.auto()
+
+
 class MessageState(enum.IntEnum):
     MQTT_MS_INVALID = 0
     MQTT_MS_PUBLISH = 1
