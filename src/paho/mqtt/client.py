@@ -20,9 +20,11 @@ from __future__ import annotations
 
 import base64
 import collections
+import copy
 import errno
 import hashlib
 import logging
+import math
 import os
 import platform
 import select
@@ -198,6 +200,7 @@ MQTT_ERR_UNKNOWN = MQTTErrorCode.MQTT_ERR_UNKNOWN
 MQTT_ERR_ERRNO = MQTTErrorCode.MQTT_ERR_ERRNO
 MQTT_ERR_QUEUE_SIZE = MQTTErrorCode.MQTT_ERR_QUEUE_SIZE
 MQTT_ERR_KEEPALIVE = MQTTErrorCode.MQTT_ERR_KEEPALIVE
+MQTT_ERR_MESSAGE_EXPIRED = MQTTErrorCode.MQTT_ERR_MESSAGE_EXPIRED
 
 MQTTv31 = MQTTProtocolVersion.MQTTv31
 MQTTv311 = MQTTProtocolVersion.MQTTv311
@@ -325,6 +328,8 @@ def error_string(mqtt_errno: MQTTErrorCode | int) -> str:
         return "Message queue full."
     elif mqtt_errno == MQTT_ERR_KEEPALIVE:
         return "Client or broker did not communicate in the keepalive interval."
+    elif mqtt_errno == MQTT_ERR_MESSAGE_EXPIRED:
+        return "Message expired locally before it could be sent."
     else:
         return "Unknown error."
 
@@ -600,10 +605,11 @@ class MQTTMessage:
     """ This is a class that describes an incoming message. It is
     passed to the `on_message` callback as the message parameter.
     """
-    __slots__ = '_topic', 'dup', 'info', 'mid', 'payload', 'properties', 'qos', 'retain', 'state', 'timestamp'
+    __slots__ = '_topic', 'dup', 'expiry_deadline', 'info', 'mid', 'payload', 'properties', 'qos', 'retain', 'state', 'timestamp'
 
     def __init__(self, mid: int = 0, topic: bytes = b""):
         self.timestamp = 0.0
+        self.expiry_deadline: float | None = None
         self.state = mqtt_ms_invalid
         self.dup = False
         self.mid = mid
@@ -709,6 +715,18 @@ class Client:
         if applications fails while processing a message, or while it pending
         locally.
 
+    :param bool local_message_expiry: (MQTT v5.0 only) when True, messages
+        published with a Message Expiry Interval property also expire while
+        waiting in the local outgoing queue (e.g. while disconnected or
+        throttled by max_inflight_messages). The client records when the
+        message was first published, sends only the remaining number of
+        seconds when the message finally goes on the wire, and discards
+        messages that have already expired instead of sending them. Messages
+        that already entered the QoS 1/2 handshake are never discarded and
+        keep their original deadline across reconnections. Defaults to
+        False, which keeps the previous behaviour of forwarding the Message
+        Expiry Interval unchanged.
+
     Callbacks
     =========
 
@@ -755,6 +773,7 @@ class Client:
         transport: Literal["tcp", "websockets", "unix"] = "tcp",
         reconnect_on_failure: bool = True,
         manual_ack: bool = False,
+        local_message_expiry: bool = False,
     ) -> None:
         transport = transport.lower()  # type: ignore
         if transport == "unix" and not hasattr(socket, "AF_UNIX"):
@@ -766,6 +785,8 @@ class Client:
         self._manual_ack = manual_ack
         self._transport = transport
         self._protocol = protocol
+        self.local_message_expiry = local_message_expiry
+        self._clock: Callable[[], float] = time_func
         self._userdata = userdata
         self._sock: SocketLike | None = None
         self._sockpairR: socket.socket | None = None
@@ -1812,6 +1833,7 @@ class Client:
             message.retain = retain
             message.dup = False
             message.properties = properties
+            self._track_message_expiry(message)
 
             with self._out_message_mutex:
                 if self._max_queued_messages > 0 and len(self._out_messages) >= self._max_queued_messages:
@@ -1824,6 +1846,8 @@ class Client:
 
                 self._out_messages[message.mid] = message
                 if self._max_inflight_messages == 0 or self._inflight_messages < self._max_inflight_messages:
+                    if self._expire_message_if_needed(message):
+                        return message.info
                     self._inflight_messages += 1
                     if qos == 1:
                         message.state = mqtt_ms_wait_for_puback
@@ -1831,7 +1855,7 @@ class Client:
                         message.state = mqtt_ms_wait_for_pubrec
 
                     rc = self._send_publish(message.mid, topic_bytes, message.payload, message.qos, message.retain,
-                                            message.dup, message.info, message.properties)
+                                            message.dup, message.info, self._outgoing_properties(message))
 
                     # remove from inflight messages so it will be send after a connection is made
                     if rc == MQTTErrorCode.MQTT_ERR_NO_CONN:
@@ -3399,6 +3423,64 @@ class Client:
         packet.extend(struct.pack("!H", len(data)))
         packet.extend(data)
 
+    def _track_message_expiry(self, message: MQTTMessage) -> None:
+        """Record the local expiry deadline of an outgoing message.
+
+        Only applies when local_message_expiry is enabled and the message
+        carries a Message Expiry Interval property (MQTT v5.0 only). The
+        deadline is based on a monotonic clock and is never reset, so a
+        message does not regain a full validity period after a reconnection.
+        """
+        if not self.local_message_expiry or self._protocol != MQTTv5:
+            return
+        properties = message.properties
+        if properties is None:
+            return
+        interval = getattr(properties, "MessageExpiryInterval", None)
+        if interval is not None:
+            message.expiry_deadline = self._clock() + interval
+
+    def _expire_message_if_needed(self, message: MQTTMessage) -> bool:
+        """Drop an outgoing message if its local expiry deadline has passed.
+
+        Messages that already entered the QoS 1/2 handshake (dup=True) are
+        never dropped, so the protocol exchange can complete. Returns True
+        when the message expired and was removed. Must be called with
+        _out_message_mutex held.
+        """
+        deadline = message.expiry_deadline
+        if deadline is None or message.dup:
+            return False
+        if self._clock() < deadline:
+            return False
+        del self._out_messages[message.mid]
+        message.state = mqtt_ms_invalid
+        message.info.rc = MQTTErrorCode.MQTT_ERR_MESSAGE_EXPIRED
+        message.info._set_as_published()
+        self._easy_log(
+            MQTT_LOG_DEBUG,
+            "Message (Mid: %d) expired locally before it could be sent",
+            message.mid,
+        )
+        return True
+
+    def _outgoing_properties(self, message: MQTTMessage) -> Properties | None:
+        """Compute the properties to put on the wire for an outgoing message.
+
+        When local message expiry applies, the Message Expiry Interval is
+        reduced to the remaining whole seconds. It can be 0 only for a
+        message that already entered the QoS 1/2 handshake and must still
+        complete it.
+        """
+        properties = message.properties
+        deadline = message.expiry_deadline
+        if properties is None or deadline is None:
+            return properties
+        remaining = deadline - self._clock()
+        adjusted = copy.copy(properties)
+        adjusted.MessageExpiryInterval = max(0, math.ceil(remaining))
+        return adjusted
+
     def _send_publish(
         self,
         mid: int,
@@ -3987,7 +4069,7 @@ class Client:
         if result == 0:
             rc = MQTTErrorCode.MQTT_ERR_SUCCESS
             with self._out_message_mutex:
-                for m in self._out_messages.values():
+                for m in list(self._out_messages.values()):
                     m.timestamp = time_func()
                     if m.state == mqtt_ms_queued:
                         self.loop_write()  # Process outgoing messages that have just been queued up
@@ -4008,6 +4090,8 @@ class Client:
                             return rc
                     elif m.qos == 1:
                         if m.state == mqtt_ms_publish:
+                            if self._expire_message_if_needed(m):
+                                continue
                             self._inflight_messages += 1
                             m.state = mqtt_ms_wait_for_puback
                             with self._in_callback_mutex:  # Don't call loop_write after _send_publish()
@@ -4018,12 +4102,14 @@ class Client:
                                     m.qos,
                                     m.retain,
                                     m.dup,
-                                    properties=m.properties
+                                    properties=self._outgoing_properties(m)
                                 )
                             if rc != MQTTErrorCode.MQTT_ERR_SUCCESS:
                                 return rc
                     elif m.qos == 2:
                         if m.state == mqtt_ms_publish:
+                            if self._expire_message_if_needed(m):
+                                continue
                             self._inflight_messages += 1
                             m.state = mqtt_ms_wait_for_pubrec
                             with self._in_callback_mutex:  # Don't call loop_write after _send_publish()
@@ -4034,7 +4120,7 @@ class Client:
                                     m.qos,
                                     m.retain,
                                     m.dup,
-                                    properties=m.properties
+                                    properties=self._outgoing_properties(m)
                                 )
                             if rc != MQTTErrorCode.MQTT_ERR_SUCCESS:
                                 return rc
@@ -4283,9 +4369,11 @@ class Client:
 
     def _update_inflight(self) -> MQTTErrorCode:
         # Dont lock message_mutex here
-        for m in self._out_messages.values():
+        for m in list(self._out_messages.values()):
             if self._inflight_messages < self._max_inflight_messages:
                 if m.qos > 0 and m.state == mqtt_ms_queued:
+                    if self._expire_message_if_needed(m):
+                        continue
                     self._inflight_messages += 1
                     if m.qos == 1:
                         m.state = mqtt_ms_wait_for_puback
@@ -4298,7 +4386,7 @@ class Client:
                         m.qos,
                         m.retain,
                         m.dup,
-                        properties=m.properties,
+                        properties=self._outgoing_properties(m),
                     )
                     if rc != MQTTErrorCode.MQTT_ERR_SUCCESS:
                         return rc
@@ -4480,6 +4568,10 @@ class Client:
                         raise
 
         msg = self._out_messages.pop(mid)
+        # A transient error such as MQTT_ERR_NO_CONN may have been recorded
+        # before the message was (re)sent; the final acknowledgement means
+        # the publication completed successfully.
+        msg.info.rc = MQTTErrorCode.MQTT_ERR_SUCCESS
         msg.info._set_as_published()
         if msg.qos > 0:
             self._inflight_messages -= 1
