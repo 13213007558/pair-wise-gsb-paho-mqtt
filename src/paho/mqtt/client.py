@@ -20,9 +20,11 @@ from __future__ import annotations
 
 import base64
 import collections
+import copy
 import errno
 import hashlib
 import logging
+import math
 import os
 import platform
 import select
@@ -198,6 +200,8 @@ MQTT_ERR_UNKNOWN = MQTTErrorCode.MQTT_ERR_UNKNOWN
 MQTT_ERR_ERRNO = MQTTErrorCode.MQTT_ERR_ERRNO
 MQTT_ERR_QUEUE_SIZE = MQTTErrorCode.MQTT_ERR_QUEUE_SIZE
 MQTT_ERR_KEEPALIVE = MQTTErrorCode.MQTT_ERR_KEEPALIVE
+MQTT_ERR_MESSAGE_EXPIRED = MQTTErrorCode.MQTT_ERR_MESSAGE_EXPIRED
+MQTT_ERR_MESSAGE_REJECTED = MQTTErrorCode.MQTT_ERR_MESSAGE_REJECTED
 
 MQTTv31 = MQTTProtocolVersion.MQTTv31
 MQTTv311 = MQTTProtocolVersion.MQTTv311
@@ -325,6 +329,10 @@ def error_string(mqtt_errno: MQTTErrorCode | int) -> str:
         return "Message queue full."
     elif mqtt_errno == MQTT_ERR_KEEPALIVE:
         return "Client or broker did not communicate in the keepalive interval."
+    elif mqtt_errno == MQTT_ERR_MESSAGE_EXPIRED:
+        return "Message expired locally before it could be sent."
+    elif mqtt_errno == MQTT_ERR_MESSAGE_REJECTED:
+        return "Message was rejected by the broker."
     else:
         return "Unknown error."
 
@@ -600,10 +608,13 @@ class MQTTMessage:
     """ This is a class that describes an incoming message. It is
     passed to the `on_message` callback as the message parameter.
     """
-    __slots__ = '_topic', 'dup', 'info', 'mid', 'payload', 'properties', 'qos', 'retain', 'state', 'timestamp'
+    __slots__ = '_topic', 'dup', 'expiry_deadline', 'info', 'mid', 'payload', 'properties', 'qos', 'retain', 'state', 'timestamp'
 
     def __init__(self, mid: int = 0, topic: bytes = b""):
         self.timestamp = 0.0
+        self.expiry_deadline: float | None = None
+        """ Monotonic deadline (from `Client` clock) after which the message must no longer be sent.
+        None when local message expiry does not apply to this message."""
         self.state = mqtt_ms_invalid
         self.dup = False
         self.mid = mid

@@ -20,6 +20,8 @@ class MQTTErrorCode(enum.IntEnum):
     MQTT_ERR_ERRNO = 14
     MQTT_ERR_QUEUE_SIZE = 15
     MQTT_ERR_KEEPALIVE = 16
+    MQTT_ERR_MESSAGE_EXPIRED = 17
+    MQTT_ERR_MESSAGE_REJECTED = 18
 
 
 class MQTTProtocolVersion(enum.IntEnum):
