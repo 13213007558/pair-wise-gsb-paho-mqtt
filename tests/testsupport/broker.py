@@ -55,6 +55,12 @@ class FakeBroker:
             except OSError:
               pass
 
+    def drop(self):
+        """Close the client connection but keep listening for a reconnect."""
+        if self._conn is not None:
+            self._conn.close()
+            self._conn = None
+
     def receive_packet(self, num_bytes):
         if self._conn is None:
             raise ValueError('Connection is not open')
