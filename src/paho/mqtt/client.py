@@ -842,6 +842,12 @@ class Client:
         ] = collections.OrderedDict()
         self._max_inflight_messages = 20
         self._inflight_messages = 0
+        # Receive Maximum advertised by the broker in CONNACK (MQTT 5.0
+        # only). It caps the number of unacknowledged QoS 1/2 PUBLISH
+        # packets, independently of _max_inflight_messages. 65535 is the
+        # MQTT 5.0 default when the property is absent, and also the
+        # effective value for MQTT 3.x (no broker-imposed limit).
+        self._receive_maximum = 65535
         self._max_queued_messages = 0
         self._connect_properties: Properties | None = None
         self._will_properties: Properties | None = None
@@ -1039,6 +1045,9 @@ class Client:
     def max_inflight_messages(self) -> int:
         """
         Maximum number of messages with QoS > 0 that can be partway through the network flow at once
+
+        With MQTT 5.0, the effective limit is the most restrictive of this
+        value and the Receive Maximum advertised by the broker in CONNACK.
 
         This property may not be changed if the connection is already open.
         """
@@ -1823,7 +1832,7 @@ class Client:
                     return message.info
 
                 self._out_messages[message.mid] = message
-                if self._max_inflight_messages == 0 or self._inflight_messages < self._max_inflight_messages:
+                if self._inflight_messages < self._inflight_max():
                     self._inflight_messages += 1
                     if qos == 1:
                         message.state = mqtt_ms_wait_for_puback
@@ -3898,6 +3907,15 @@ class Client:
                     # CONNACK, the client must use that value instead of the one
                     # it sent (MQTT 5.0 spec 3.2.2.3.14).
                     self._keepalive = properties.ServerKeepAlive
+                # MQTT 5.0: the broker Receive Maximum caps the number of
+                # unacknowledged QoS 1/2 PUBLISH packets we may have in
+                # flight (MQTT 5.0 spec 3.2.2.3.3). It is re-read on every
+                # (re)connection because the broker may advertise a smaller
+                # value than before.
+                if hasattr(properties, "ReceiveMaximum"):
+                    self._receive_maximum = properties.ReceiveMaximum
+                else:
+                    self._receive_maximum = 65535
         else:
             (flags, result) = struct.unpack("!BB", self._in_packet['packet'])
             reason = convert_connack_rc_to_reason_code(result)
@@ -4008,6 +4026,12 @@ class Client:
                             return rc
                     elif m.qos == 1:
                         if m.state == mqtt_ms_publish:
+                            if self._inflight_messages >= self._inflight_max():
+                                # Broker Receive Maximum is exhausted. Keep
+                                # the message queued, it will be sent when a
+                                # PUBACK/PUBCOMP frees an in-flight slot.
+                                m.state = mqtt_ms_queued
+                                continue
                             self._inflight_messages += 1
                             m.state = mqtt_ms_wait_for_puback
                             with self._in_callback_mutex:  # Don't call loop_write after _send_publish()
@@ -4024,6 +4048,10 @@ class Client:
                                 return rc
                     elif m.qos == 2:
                         if m.state == mqtt_ms_publish:
+                            if self._inflight_messages >= self._inflight_max():
+                                # Same as QoS 1 above: wait for a slot.
+                                m.state = mqtt_ms_queued
+                                continue
                             self._inflight_messages += 1
                             m.state = mqtt_ms_wait_for_pubrec
                             with self._in_callback_mutex:  # Don't call loop_write after _send_publish()
@@ -4281,10 +4309,21 @@ class Client:
         else:
             return self._send_pubcomp(mid)
 
+    def _inflight_max(self) -> int:
+        """Effective in-flight limit for QoS 1/2 PUBLISH packets.
+
+        Combines the local max_inflight_messages (0 means no local limit)
+        with the Receive Maximum sent by the broker in CONNACK, whichever
+        is most restrictive.
+        """
+        if self._max_inflight_messages == 0:
+            return self._receive_maximum
+        return min(self._max_inflight_messages, self._receive_maximum)
+
     def _update_inflight(self) -> MQTTErrorCode:
         # Dont lock message_mutex here
         for m in self._out_messages.values():
-            if self._inflight_messages < self._max_inflight_messages:
+            if self._inflight_messages < self._inflight_max():
                 if m.qos > 0 and m.state == mqtt_ms_queued:
                     self._inflight_messages += 1
                     if m.qos == 1:
@@ -4314,6 +4353,8 @@ class Client:
             return MQTTErrorCode.MQTT_ERR_PROTOCOL
 
         mid, = struct.unpack("!H", self._in_packet['packet'][:2])
+        reasonCode = None
+        properties = None
         if self._protocol == MQTTv5:
             if self._in_packet['remaining_length'] > 2:
                 reasonCode = ReasonCode(PUBREC >> 4)
@@ -4327,6 +4368,14 @@ class Client:
         with self._out_message_mutex:
             if mid in self._out_messages:
                 msg = self._out_messages[mid]
+                if reasonCode is not None and reasonCode.value >= 0x80:
+                    # The receiver rejected the QoS 2 PUBLISH: the exchange
+                    # ends here (MQTT 5.0 spec 4.9). Do not send PUBREL, do
+                    # not retransmit the PUBLISH, and release the in-flight
+                    # slot so a queued message can be sent.
+                    if properties is None:
+                        properties = Properties(PUBREC >> 4)
+                    return self._do_on_publish(mid, reasonCode, properties)
                 msg.state = mqtt_ms_wait_for_pubcomp
                 msg.timestamp = time_func()
                 return self._send_pubrel(mid)
@@ -4483,7 +4532,7 @@ class Client:
         msg.info._set_as_published()
         if msg.qos > 0:
             self._inflight_messages -= 1
-            if self._max_inflight_messages > 0:
+            if self._max_inflight_messages > 0 or self._receive_maximum < 65535:
                 rc = self._update_inflight()
                 if rc != MQTTErrorCode.MQTT_ERR_SUCCESS:
                     return rc
