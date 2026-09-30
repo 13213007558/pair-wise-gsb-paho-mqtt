@@ -40,7 +40,19 @@ from typing import TYPE_CHECKING, Any, Callable, NamedTuple, Union, cast, overlo
 
 from paho.mqtt.packettypes import PacketTypes
 
-from .enums import CallbackAPIVersion, ConnackCode, LogLevel, MessageState, MessageType, MQTTErrorCode, MQTTProtocolVersion, PahoClientMode, _ConnectionState
+from . import MQTTException
+from .enums import (
+    CallbackAPIVersion,
+    ConnackCode,
+    LogLevel,
+    MessageState,
+    MessageType,
+    MQTTErrorCode,
+    MQTTProtocolVersion,
+    PahoClientMode,
+    _AuthState,
+    _ConnectionState,
+)
 from .matcher import MQTTMatcher
 from .properties import Properties
 from .reasoncodes import ReasonCode, ReasonCodes
@@ -254,6 +266,7 @@ CallbackOnConnect_v1 = Union[CallbackOnConnect_v1_mqtt5, CallbackOnConnect_v1_mq
 CallbackOnConnect_v2 = Callable[["Client", Any, ConnectFlags, ReasonCode, Union[Properties, None]], None]
 CallbackOnConnect = Union[CallbackOnConnect_v1, CallbackOnConnect_v2]
 CallbackOnConnectFail = Callable[["Client", Any], None]
+CallbackOnAuth = Callable[["Client", Any, ReasonCode, Properties], Union[bytes, bytearray, None]]
 CallbackOnDisconnect_v1_mqtt3 = Callable[["Client", Any, MQTTErrorCode], None]
 CallbackOnDisconnect_v1_mqtt5 = Callable[["Client", Any, Union[ReasonCode, int, None], Union[Properties, None]], None]
 CallbackOnDisconnect_v1 = Union[CallbackOnDisconnect_v1_mqtt3, CallbackOnDisconnect_v1_mqtt5]
@@ -400,6 +413,8 @@ def convert_disconnect_error_code_to_reason_code(rc: MQTTErrorCode) -> ReasonCod
         return ReasonCode(PacketTypes.DISCONNECT, "Success")
     if rc == MQTTErrorCode.MQTT_ERR_KEEPALIVE:
         return ReasonCode(PacketTypes.DISCONNECT, "Keep alive timeout")
+    if rc == MQTTErrorCode.MQTT_ERR_AUTH:
+        return ReasonCode(PacketTypes.DISCONNECT, "Bad authentication method")
     if rc == MQTTErrorCode.MQTT_ERR_CONN_LOST:
         return ReasonCode(PacketTypes.DISCONNECT, "Unspecified error")
     return ReasonCode(PacketTypes.DISCONNECT, "Unspecified error")
@@ -742,7 +757,7 @@ class Client:
 
     `on_connect`, `on_connect_fail`, `on_disconnect`, `on_message`, `on_publish`,
     `on_subscribe`, `on_unsubscribe`, `on_log`, `on_socket_open`, `on_socket_close`,
-    `on_socket_register_write`, `on_socket_unregister_write`
+    `on_socket_register_write`, `on_socket_unregister_write`, `on_auth`
     """
 
     def __init__(
@@ -845,6 +860,11 @@ class Client:
         self._max_queued_messages = 0
         self._connect_properties: Properties | None = None
         self._will_properties: Properties | None = None
+        # MQTT v5.0 enhanced authentication (AUTH packet) state. The
+        # authentication method is negotiated in CONNECT and is fixed for
+        # the whole connection (including re-authentication exchanges).
+        self._auth_method: str | None = None
+        self._auth_state = _AuthState.MQTT_AS_IDLE
         self._will = False
         self._will_topic = b""
         self._will_payload: bytes | bytearray = b""
@@ -881,6 +901,7 @@ class Client:
         self._on_publish: CallbackOnPublish | None = None
         self._on_unsubscribe: CallbackOnUnsubscribe | None = None
         self._on_disconnect: CallbackOnDisconnect | None = None
+        self._on_auth: CallbackOnAuth | None = None
         self._on_socket_open: CallbackOnSocket | None = None
         self._on_socket_close: CallbackOnSocket | None = None
         self._on_socket_register_write: CallbackOnSocket | None = None
@@ -1545,6 +1566,14 @@ class Client:
         self._connect_properties = properties
         self._state = _ConnectionState.MQTT_CS_CONNECT_ASYNC
 
+        # MQTT v5.0 enhanced authentication: remember the authentication
+        # method negotiated in CONNECT. It cannot be changed by any later
+        # packet of this connection.
+        self._auth_method = None
+        if properties is not None and hasattr(properties, "AuthenticationMethod"):
+            self._auth_method = properties.AuthenticationMethod
+        self._auth_state = _AuthState.MQTT_AS_IDLE
+
     def reconnect_delay_set(self, min_delay: int = 1, max_delay: int = 120) -> None:
         """ Configure the exponential reconnect delay
 
@@ -1919,6 +1948,57 @@ class Client:
             self._state = _ConnectionState.MQTT_CS_DISCONNECTING
 
         return self._send_disconnect(reasoncode, properties)
+
+    def reauthenticate(self) -> MQTTErrorCode:
+        """(MQTT v5.0 only) Initiate a re-authentication exchange with the broker.
+
+        This sends an AUTH packet with the Re-authenticate reason code. The
+        initial Authentication Data is obtained by calling the on_auth
+        callback, which must therefore be set before calling this function.
+        The broker then continues the exchange with AUTH (Continue
+        authentication) packets, each of which is answered through on_auth,
+        and completes it with AUTH (Success).
+
+        Re-authentication requires that an Authentication Method was
+        negotiated in the CONNECT packet (through the properties argument
+        of connect()/connect_async()). The same method is reused, it
+        cannot be changed.
+
+        Normal traffic (PUBLISH, PUBACK, ...) may continue while a
+        re-authentication exchange is in progress; in-flight QoS exchanges
+        and packet identifiers are not affected.
+
+        Returns MQTT_ERR_SUCCESS if the first AUTH packet was queued,
+        MQTT_ERR_NOT_SUPPORTED if not using MQTT v5.0 or if no
+        Authentication Method was negotiated, MQTT_ERR_NO_CONN if not
+        connected, or MQTT_ERR_INVAL if an authentication exchange is
+        already in progress.
+        """
+        if self._protocol != MQTTv5 or self._auth_method is None:
+            return MQTTErrorCode.MQTT_ERR_NOT_SUPPORTED
+        if self._state != _ConnectionState.MQTT_CS_CONNECTED:
+            return MQTTErrorCode.MQTT_ERR_NO_CONN
+        if self._auth_state != _AuthState.MQTT_AS_IDLE:
+            return MQTTErrorCode.MQTT_ERR_INVAL
+
+        with self._callback_mutex:
+            on_auth = self.on_auth
+
+        if on_auth is None:
+            return MQTTErrorCode.MQTT_ERR_INVAL
+
+        reason = ReasonCode(PacketTypes.AUTH, "Re-authenticate")
+        properties = Properties(PacketTypes.AUTH)
+        properties.AuthenticationMethod = self._auth_method
+
+        auth_data = on_auth(self, self._userdata, reason, properties)
+        if auth_data is not None and not isinstance(auth_data, (bytes, bytearray)):
+            raise ValueError("on_auth must return bytes or None")
+
+        rc = self._send_auth(reason, bytes(auth_data) if auth_data is not None else None)
+        if rc == MQTTErrorCode.MQTT_ERR_SUCCESS:
+            self._auth_state = _AuthState.MQTT_AS_REAUTHENTICATE
+        return rc
 
     def subscribe(
         self,
@@ -2809,6 +2889,57 @@ class Client:
         return decorator
 
     @property
+    def on_auth(self) -> CallbackOnAuth | None:
+        """The callback called to continue an MQTT v5.0 enhanced
+        authentication (AUTH packet) exchange.
+
+        Expected signature (for all callback API versions)::
+
+            auth_callback(client, userdata, reason_code, properties)
+
+        The callback must return the next Authentication Data as bytes
+        (or None to send no data); any cryptographic computation is the
+        responsibility of the application. It is called synchronously from
+        the network loop and must return promptly - the client never waits
+        for the application to run another loop iteration.
+
+        It is called when:
+
+        * the broker sends AUTH (Continue authentication), either during
+          the initial exchange (after CONNECT, before CONNACK) or during
+          a re-authentication exchange. reason_code is
+          "Continue authentication" and properties are the ones received
+          from the broker (including its Authentication Data).
+        * the application calls reauthenticate(). reason_code is
+          "Re-authenticate" and properties only contain the negotiated
+          Authentication Method.
+
+        :param Client client: the client instance for this callback
+        :param userdata: the private user data as set in Client() or user_data_set()
+        :param ReasonCode reason_code: the reason code of the AUTH packet
+            being answered ("Continue authentication" or "Re-authenticate").
+        :param Properties properties: the MQTT v5.0 properties of the AUTH
+            packet being answered.
+
+        Decorator: @client.auth_callback() ("client" is the name of the
+            instance which this callback is being attached to)
+        """
+        return self._on_auth
+
+    @on_auth.setter
+    def on_auth(self, func: CallbackOnAuth | None) -> None:
+        with self._callback_mutex:
+            self._on_auth = func
+
+    def auth_callback(
+        self,
+    ) -> Callable[[CallbackOnAuth], CallbackOnAuth]:
+        def decorator(func: CallbackOnAuth) -> CallbackOnAuth:
+            self.on_auth = func
+            return func
+        return decorator
+
+    @property
     def on_socket_open(self) -> CallbackOnSocket | None:
         """The callback called just after the socket was opend.
 
@@ -3604,6 +3735,12 @@ class Client:
                 keepalive,
                 self._client_id
             )
+        if self._protocol == MQTTv5 and self._auth_method is not None:
+            # CONNECT carries an Authentication Method: the broker may
+            # continue the exchange with AUTH packets until the CONNACK.
+            self._auth_state = _AuthState.MQTT_AS_INITIAL
+        else:
+            self._auth_state = _AuthState.MQTT_AS_IDLE
         return self._packet_queue(command, packet, 0, 0)
 
     def _send_disconnect(
@@ -3642,6 +3779,39 @@ class Client:
                 if properties is not None:
                     packet += packed_props
 
+        return self._packet_queue(command, packet, 0, 0)
+
+    def _send_auth(
+        self,
+        reasoncode: ReasonCode,
+        authentication_data: bytes | None = None,
+    ) -> MQTTErrorCode:
+        if self._protocol != MQTTv5 or self._auth_method is None:
+            return MQTTErrorCode.MQTT_ERR_NOT_SUPPORTED
+
+        properties = Properties(PacketTypes.AUTH)
+        # The authentication method was fixed by the initial negotiation:
+        # repeat it on every AUTH packet so it can never be switched
+        # mid-exchange.
+        properties.AuthenticationMethod = self._auth_method
+        if authentication_data is not None:
+            properties.AuthenticationData = authentication_data
+        packed_auth_properties = properties.pack()
+
+        remaining_length = 1 + len(packed_auth_properties)
+
+        command = AUTH
+        packet = bytearray()
+        packet.append(command)
+        self._pack_remaining_length(packet, remaining_length)
+        packet += reasoncode.pack()
+        packet += packed_auth_properties
+
+        self._easy_log(
+            MQTT_LOG_DEBUG, "Sending AUTH reasonCode=%s properties=%s",
+            reasoncode,
+            properties,
+        )
         return self._packet_queue(command, packet, 0, 0)
 
     def _send_subscribe(
@@ -3853,6 +4023,8 @@ class Client:
         elif cmd == DISCONNECT and self._protocol == MQTTv5:  # only allowed in MQTT 5.0
             self._handle_disconnect()
             return MQTTErrorCode.MQTT_ERR_SUCCESS
+        elif cmd == AUTH and self._protocol == MQTTv5:  # only allowed in MQTT 5.0
+            return self._handle_auth()
         else:
             # If we don't recognise the command, return an error straight away.
             self._easy_log(MQTT_LOG_ERR, "Error: Unrecognised command %s", cmd)
@@ -3925,6 +4097,10 @@ class Client:
                 )
                 self._client_id = _base62(uuid.uuid4().int, padding=22).encode("utf8")
                 return self.reconnect()
+
+        # Receiving a CONNACK (success or failure) ends the initial
+        # enhanced authentication exchange.
+        self._auth_state = _AuthState.MQTT_AS_IDLE
 
         if result == 0:
             self._state = _ConnectionState.MQTT_CS_CONNECTED
@@ -4086,12 +4262,124 @@ class Client:
                        properties
                        )
 
+        # A DISCONNECT received in the middle of an authentication
+        # exchange terminates it; the connection terminal state is
+        # reported below through on_disconnect.
+        self._auth_state = _AuthState.MQTT_AS_IDLE
         self._sock_close()
         self._do_on_disconnect(
             packet_from_broker=True,
             v1_rc=MQTTErrorCode.MQTT_ERR_SUCCESS,  # If reason is absent (remaining length < 1), it means normal disconnection
             reason=reasonCode,
             properties=properties,
+        )
+
+    def _auth_fail(self, fmt: str, *args: Any) -> MQTTErrorCode:
+        """Abort the connection after a failed authentication exchange.
+
+        Closes the connection and moves to a clear terminal state. The
+        application is informed through on_disconnect with MQTT_ERR_AUTH
+        (done by the network loop when MQTT_ERR_AUTH is returned).
+        """
+        self._easy_log(MQTT_LOG_ERR, fmt, *args)
+        self._auth_state = _AuthState.MQTT_AS_IDLE
+        self._sock_close()
+        self._state = _ConnectionState.MQTT_CS_CONNECTION_LOST
+        return MQTTErrorCode.MQTT_ERR_AUTH
+
+    def _handle_auth(self) -> MQTTErrorCode:
+        packet_type = AUTH >> 4
+        if self._in_packet['remaining_length'] == 0:
+            reason = ReasonCode(packet_type, "Success")
+            properties = Properties(packet_type)
+        else:
+            reason = ReasonCode(packet_type)
+            try:
+                reason.unpack(self._in_packet['packet'])
+            except (KeyError, ValueError):
+                return self._auth_fail(
+                    "Received AUTH with an invalid reason code")
+            properties = Properties(packet_type)
+            if self._in_packet['remaining_length'] > 1:
+                try:
+                    properties.unpack(self._in_packet['packet'][1:])
+                except MQTTException:
+                    return self._auth_fail(
+                        "Received AUTH with malformed properties")
+
+        self._easy_log(MQTT_LOG_DEBUG, "Received AUTH %s %s",
+                       reason,
+                       properties,
+                       )
+
+        if self._auth_method is None:
+            # No Authentication Method was negotiated in CONNECT, the
+            # broker must not send AUTH packets at all.
+            return self._auth_fail(
+                "Received AUTH packet but no authentication method was negotiated")
+
+        if (hasattr(properties, "AuthenticationMethod")
+                and properties.AuthenticationMethod != self._auth_method):
+            # The authentication method is fixed by the initial
+            # negotiation and must not be switched mid-exchange.
+            return self._auth_fail(
+                "Received AUTH with unexpected authentication method %r (negotiated %r)",
+                properties.AuthenticationMethod, self._auth_method)
+
+        if reason == ReasonCode(packet_type, "Continue authentication"):
+            if self._auth_state == _AuthState.MQTT_AS_IDLE:
+                return self._auth_fail(
+                    "Received unexpected AUTH (Continue authentication) outside of an authentication exchange")
+            # Both the initial exchange (before CONNACK) and a
+            # re-authentication continue here.
+            return self._auth_respond(reason, properties)
+        elif reason == ReasonCode(packet_type, "Re-authenticate"):
+            # Re-authentication is always initiated by the client (see
+            # reauthenticate()); the broker must not send this reason code.
+            return self._auth_fail(
+                "Received AUTH with Re-authenticate reason code from the broker")
+        elif reason == ReasonCode(packet_type, "Success"):
+            if self._auth_state != _AuthState.MQTT_AS_REAUTHENTICATE:
+                return self._auth_fail(
+                    "Received unexpected AUTH (Success) outside of a re-authentication exchange")
+            self._auth_state = _AuthState.MQTT_AS_IDLE
+            self._easy_log(MQTT_LOG_DEBUG, "Re-authentication complete")
+            return MQTTErrorCode.MQTT_ERR_SUCCESS
+        else:
+            return self._auth_fail(
+                "Received AUTH with failure reason code %s", reason)
+
+    def _auth_respond(self, reason: ReasonCode, properties: Properties) -> MQTTErrorCode:
+        """Produce the next Authentication Data through the on_auth callback
+        and send it in an AUTH (Continue authentication) packet."""
+        with self._callback_mutex:
+            on_auth = self.on_auth
+
+        if on_auth is None:
+            return self._auth_fail(
+                "Received AUTH (%s) but no on_auth callback is set", reason)
+
+        try:
+            with self._in_callback_mutex:
+                auth_data = on_auth(self, self._userdata, reason, properties)
+        except Exception as err:
+            # Never leave the exchange hanging: terminate the connection so
+            # the application gets a clear terminal state through
+            # on_disconnect (MQTT_ERR_AUTH).
+            self._easy_log(
+                MQTT_LOG_ERR, 'Caught exception in on_auth: %s', err)
+            return self._auth_fail(
+                "Authentication exchange aborted due to on_auth callback error")
+
+        if auth_data is not None and not isinstance(auth_data, (bytes, bytearray)):
+            self._easy_log(
+                MQTT_LOG_ERR, "on_auth must return bytes or None, got %s", type(auth_data))
+            return self._auth_fail(
+                "Authentication exchange aborted due to invalid on_auth return value")
+
+        return self._send_auth(
+            ReasonCode(AUTH >> 4, "Continue authentication"),
+            bytes(auth_data) if auth_data is not None else None,
         )
 
     def _handle_suback(self) -> None:
