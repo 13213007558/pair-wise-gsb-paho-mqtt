@@ -1,3 +1,6 @@
+import queue
+import socket
+import struct
 import threading
 import time
 import unicodedata
@@ -303,7 +306,408 @@ class Test_connect_v5:
             mqttc.loop_stop()
 
 
+class FakeSocketPairBroker:
+    def __init__(self):
+        client_socket, self._conn = socket.socketpair()
+        client_socket.setblocking(False)
+        self._conn.settimeout(5)
+        self.client_socket = client_socket
+
+    def send_packet(self, packet):
+        return self._conn.send(packet)
+
+    def finish(self):
+        self._conn.close()
+        self.client_socket.close()
+
+
+class TestMQTTv5EnhancedAuthentication:
+    @pytest.fixture(autouse=True)
+    def use_native_socketpair(self, monkeypatch):
+        monkeypatch.setattr(client, "_socketpair_compat", socket.socketpair)
+
+    @staticmethod
+    def _auth_properties(data):
+        return (
+            mqtt5_props.gen_string_prop(
+                mqtt5_props.PROP_AUTHENTICATION_METHOD, "SCRAM-SHA-256")
+            + bytes([mqtt5_props.PROP_AUTHENTICATION_DATA])
+            + struct.pack("!H", len(data))
+            + data
+        )
+
+    def _auth_packet(self, reason_code, data):
+        packed_properties = mqtt5_props.prop_finalise(self._auth_properties(data))
+        return (
+            b"\xf0"
+            + paho_test.pack_remaining_length(1 + len(packed_properties))
+            + bytes([reason_code])
+            + packed_properties
+        )
+
+    def _connack_challenge_packet(self, data):
+        packed_properties = mqtt5_props.prop_finalise(self._auth_properties(data))
+        return (
+            b"\x20"
+            + paho_test.pack_remaining_length(2 + len(packed_properties))
+            + b"\x00\x18"
+            + packed_properties
+        )
+
+    @staticmethod
+    def _connack_success_packet():
+        return paho_test.gen_connack(rc=0, proto_ver=5)
+
+    @staticmethod
+    def _read_packet(broker):
+        first = broker._conn.recv(1)
+        assert first
+        multiplier = 1
+        remaining_length = 0
+        while True:
+            encoded = broker._conn.recv(1)
+            assert encoded
+            byte = encoded[0]
+            remaining_length |= (byte & 0x7f) * multiplier
+            if not byte & 0x80:
+                break
+            multiplier *= 128
+        body = b""
+        while len(body) < remaining_length:
+            chunk = broker._conn.recv(remaining_length - len(body))
+            assert chunk
+            body += chunk
+        return first + paho_test.pack_remaining_length(remaining_length) + body
+
+    def _connect_client(self, broker, **client_kwargs):
+        connect_properties = Properties(PacketTypes.CONNECT)
+        connect_properties.AuthenticationMethod = "SCRAM-SHA-256"
+        connect_properties.AuthenticationData = b"client-first"
+        mqttc = client.Client(
+            CallbackAPIVersion.VERSION2,
+            "enhanced-auth",
+            protocol=MQTTProtocolVersion.MQTTv5,
+            transport="tcp",
+            **client_kwargs,
+        )
+        mqttc._create_socket = lambda: broker.client_socket
+        mqttc.connect_async(
+            "localhost",
+            1,
+            properties=connect_properties,
+        )
+        return mqttc, connect_properties
+
+    def _complete_initial_authentication(self, mqttc, fake_broker):
+        expected_connect = paho_test.gen_connect(
+            "enhanced-auth",
+            proto_ver=5,
+            properties=self._auth_properties(b"client-first"),
+        )
+        assert self._read_packet(fake_broker) == expected_connect
+
+        def on_auth(client, userdata, reason_code, properties):
+            if properties.AuthenticationData == b"server-first":
+                return b"client-second"
+            return b"client-final"
+
+        mqttc.on_auth = on_auth
+        connected = threading.Event()
+        mqttc.on_connect = lambda *args: connected.set()
+
+        fake_broker.send_packet(self._connack_challenge_packet(b"server-first"))
+        assert self._read_packet(fake_broker) == self._auth_packet(24, b"client-second")
+        fake_broker.send_packet(self._auth_packet(24, b"server-second"))
+        assert self._read_packet(fake_broker) == self._auth_packet(24, b"client-final")
+        fake_broker.send_packet(self._connack_success_packet())
+        assert connected.wait(1)
+
+    def test_initial_two_round_challenge(self):
+        broker = FakeSocketPairBroker()
+        mqttc, _properties = self._connect_client(broker)
+        mqttc.loop_start()
+        try:
+            self._complete_initial_authentication(mqttc, broker)
+        finally:
+            mqttc.disconnect()
+            mqttc.loop_stop()
+            broker.finish()
+
+    def test_initial_authentication_rejects_normal_traffic_and_stale_continue(self):
+        broker = FakeSocketPairBroker()
+        mqttc, _properties = self._connect_client(broker)
+        mqttc.loop_start()
+        try:
+            self._read_packet(broker)
+
+            def on_auth(client, userdata, reason_code, properties):
+                publish_info = client.publish("during/connect/auth", b"blocked")
+                assert publish_info.rc == MQTTErrorCode.MQTT_ERR_NO_CONN
+                return b"client-second"
+
+            mqttc.on_auth = on_auth
+            broker.send_packet(self._connack_challenge_packet(b"server-first"))
+            assert self._read_packet(broker) == self._auth_packet(24, b"client-second")
+            assert mqttc.auth_continue(b"late") == MQTTErrorCode.MQTT_ERR_INVAL
+        finally:
+            mqttc.disconnect()
+            mqttc.loop_stop()
+            broker.finish()
+
+    def test_reauthentication_rejects_changed_method(self):
+        broker = FakeSocketPairBroker()
+        mqttc, _properties = self._connect_client(
+            broker, reconnect_on_failure=False)
+        disconnected = threading.Event()
+
+        def on_disconnect(client, userdata, flags, reason_code, properties):
+            assert reason_code == ReasonCode(PacketTypes.DISCONNECT, "Protocol error")
+            disconnected.set()
+
+        mqttc.on_disconnect = on_disconnect
+        mqttc.loop_start()
+        try:
+            self._complete_initial_authentication(mqttc, broker)
+            mqttc.reauthenticate(b"reauth-first")
+            assert self._read_packet(broker) == self._auth_packet(25, b"reauth-first")
+
+            changed_properties = (
+                mqtt5_props.gen_string_prop(
+                    mqtt5_props.PROP_AUTHENTICATION_METHOD, "OTHER")
+                + bytes([mqtt5_props.PROP_AUTHENTICATION_DATA])
+                + struct.pack("!H", 5) + b"wrong"
+            )
+            packet = (
+                b"\xf0"
+                + paho_test.pack_remaining_length(
+                    1 + len(mqtt5_props.prop_finalise(changed_properties)))
+                + b"\x18"
+                + mqtt5_props.prop_finalise(changed_properties)
+            )
+            broker.send_packet(packet)
+            disconnect_packet = self._read_packet(broker)
+            assert disconnect_packet[0] == 0xe0
+            assert disconnect_packet[2] == 130
+            assert disconnected.wait(1)
+            assert not mqttc.is_connected()
+        finally:
+            mqttc.loop_stop()
+            broker.finish()
+
+    def test_reauthentication_interleaves_with_qos_traffic(self):
+        broker = FakeSocketPairBroker()
+        mqttc, _properties = self._connect_client(broker)
+        published = queue.Queue()
+        auth_events = queue.Queue()
+        mqttc.on_publish = lambda client, userdata, mid, reason_code, properties: (
+            published.put(mid)
+        )
+        mqttc.loop_start()
+        try:
+            self._complete_initial_authentication(mqttc, broker)
+
+            mqttc.publish("reauth/out", b"one", qos=1)
+            first_publish = self._read_packet(broker)
+            assert first_publish == paho_test.gen_publish(
+                "reauth/out", qos=1, payload=b"one", mid=1, proto_ver=5)
+
+            assert mqttc.reauthenticate(b"reauth-first") == MQTTErrorCode.MQTT_ERR_SUCCESS
+            assert self._read_packet(broker) == self._auth_packet(25, b"reauth-first")
+
+            def on_auth(client, userdata, reason_code, properties):
+                auth_events.put(reason_code.value)
+                if reason_code == 0:
+                    client.publish("reauth/out", b"two", qos=1)
+                return b"reauth-final"
+
+            mqttc.on_auth = on_auth
+            broker.send_packet(self._auth_packet(24, b"reauth-second"))
+
+            broker.send_packet(
+                paho_test.gen_puback(1, proto_ver=5, reason_code=0, properties="")
+                + self._auth_packet(0, b"")
+                + paho_test.gen_publish("reauth/in", qos=1, payload=b"in", mid=42, proto_ver=5)
+            )
+            assert self._read_packet(broker) == self._auth_packet(24, b"reauth-final")
+            assert self._read_packet(broker) == paho_test.gen_publish(
+                "reauth/out", qos=1, payload=b"two", mid=2, proto_ver=5)
+            second_info = next(
+                info for info in mqttc._out_messages.values() if info.mid == 2
+            ).info if 2 in mqttc._out_messages else None
+            assert second_info is not None
+            assert self._read_packet(broker) == b"\x40\x02\x00\x2a"
+            time.sleep(0.05)
+            assert published.get(timeout=1) == 1
+            assert auth_events.get(timeout=1) == 24
+            assert auth_events.get(timeout=1) == 0
+            assert mqttc.is_connected()
+        finally:
+            mqttc.disconnect()
+            mqttc.loop_stop()
+            broker.finish()
+
+    def test_external_event_loop_can_continue_authentication(self):
+        broker = FakeSocketPairBroker()
+        write_requests = []
+        mqttc, _properties = self._connect_client(broker)
+        mqttc.on_socket_register_write = (
+            lambda client, userdata, sock: write_requests.append(sock)
+        )
+        assert mqttc.reconnect() == MQTTErrorCode.MQTT_ERR_SUCCESS
+        mqttc.loop_write()
+        assert self._read_packet(broker)[0] == 0x10
+
+        connected = threading.Event()
+        mqttc.on_connect = lambda *args: connected.set()
+
+        def on_auth(client, userdata, reason_code, properties):
+            if properties.AuthenticationData == b"server-first":
+                return None
+            return b"client-final"
+
+        mqttc.on_auth = on_auth
+        broker.send_packet(self._connack_challenge_packet(b"server-first"))
+        assert mqttc.loop_read() == MQTTErrorCode.MQTT_ERR_SUCCESS
+        assert mqttc._auth_waiting
+        assert mqttc.auth_continue(b"client-second") == MQTTErrorCode.MQTT_ERR_SUCCESS
+        mqttc.loop_write()
+        assert self._read_packet(broker) == self._auth_packet(24, b"client-second")
+
+        broker.send_packet(self._auth_packet(24, b"server-second"))
+        for _ in range(4):
+            assert mqttc.loop_read() == MQTTErrorCode.MQTT_ERR_SUCCESS
+        mqttc.loop_write()
+        assert self._read_packet(broker) == self._auth_packet(24, b"client-final")
+
+        broker.send_packet(self._connack_success_packet())
+        assert mqttc.loop_read() == MQTTErrorCode.MQTT_ERR_SUCCESS
+        assert connected.wait(1)
+        assert write_requests
+        broker.finish()
+
+    def test_external_event_loop_reauthentication_interleaves_deterministically(self):
+        broker = FakeSocketPairBroker()
+        mqttc, _properties = self._connect_client(broker)
+        mqttc.on_socket_register_write = lambda client, userdata, sock: None
+        mqttc.reconnect()
+        mqttc.loop_write()
+        self._read_packet(broker)
+
+        def on_auth(client, userdata, reason_code, properties):
+            if properties is None:
+                return b"reauth-first"
+            if properties.AuthenticationData == b"server-first":
+                return b"client-second"
+            if properties.AuthenticationData == b"server-second":
+                return b"client-final"
+            return b"reauth-final"
+
+        mqttc.on_auth = on_auth
+        connected = threading.Event()
+        mqttc.on_connect = lambda *args: connected.set()
+        broker.send_packet(self._connack_challenge_packet(b"server-first"))
+        mqttc.loop_read()
+        mqttc.loop_write()
+        assert self._read_packet(broker) == self._auth_packet(24, b"client-second")
+        broker.send_packet(self._auth_packet(24, b"server-second"))
+        mqttc.loop_read()
+        mqttc.loop_write()
+        assert self._read_packet(broker) == self._auth_packet(24, b"client-final")
+        broker.send_packet(self._connack_success_packet())
+        mqttc.loop_read()
+        assert connected.wait(1)
+
+        first = mqttc.publish("manual/reauth", b"one", qos=1)
+        mqttc.loop_write()
+        assert self._read_packet(broker) == paho_test.gen_publish(
+            "manual/reauth", qos=1, payload=b"one", mid=1, proto_ver=5)
+        assert mqttc.reauthenticate() == MQTTErrorCode.MQTT_ERR_SUCCESS
+        mqttc.loop_write()
+        assert self._read_packet(broker) == self._auth_packet(25, b"reauth-first")
+
+        broker.send_packet(self._auth_packet(24, b"reauth-second"))
+        mqttc.loop_read()
+        mqttc.loop_write()
+        assert self._read_packet(broker) == self._auth_packet(24, b"reauth-final")
+
+        broker.send_packet(
+            paho_test.gen_puback(1, proto_ver=5, reason_code=0, properties="")
+            + self._auth_packet(0, b"")
+            + paho_test.gen_publish("manual/in", qos=1, payload=b"in", mid=42, proto_ver=5)
+        )
+        assert mqttc.loop_read() == MQTTErrorCode.MQTT_ERR_SUCCESS
+        assert mqttc.loop_read() == MQTTErrorCode.MQTT_ERR_SUCCESS
+        mqttc.loop_write()
+        assert mqttc.loop_read() == MQTTErrorCode.MQTT_ERR_SUCCESS
+        mqttc.loop_write()
+        assert self._read_packet(broker) == b"\x40\x02\x00\x2a"
+        first.wait_for_publish(0.1)
+
+        second = mqttc.publish("manual/reauth", b"two", qos=1)
+        mqttc.loop_write()
+        assert self._read_packet(broker) == paho_test.gen_publish(
+            "manual/reauth", qos=1, payload=b"two", mid=2, proto_ver=5)
+        broker.send_packet(paho_test.gen_puback(2, proto_ver=5, reason_code=0, properties=""))
+        mqttc.loop_read()
+        second.wait_for_publish(0.1)
+        assert first.is_published()
+        assert second.is_published()
+        assert mqttc.is_connected()
+        broker.finish()
+
+    def test_callback_exception_has_disconnected_terminal_state(self):
+        broker = FakeSocketPairBroker()
+        mqttc, _properties = self._connect_client(broker, reconnect_on_failure=False)
+        disconnected = threading.Event()
+
+        def on_auth(client, userdata, reason_code, properties):
+            raise RuntimeError("bad credentials")
+
+        def on_disconnect(client, userdata, flags, reason_code, properties):
+            assert reason_code == ReasonCode(
+                PacketTypes.DISCONNECT, "Not authorized")
+            disconnected.set()
+
+        mqttc.on_auth = on_auth
+        mqttc.on_disconnect = on_disconnect
+        mqttc.loop_start()
+        try:
+            self._read_packet(broker)
+            broker.send_packet(self._connack_challenge_packet(b"server-first"))
+            packet = self._read_packet(broker)
+            assert packet[0] == 0xe0
+            assert packet[2] == 135
+            assert disconnected.wait(1)
+            assert not mqttc.is_connected()
+        finally:
+            mqttc.loop_stop()
+            broker.finish()
+
+    def test_disconnect_during_reauthentication(self):
+        broker = FakeSocketPairBroker()
+        mqttc, _properties = self._connect_client(broker, reconnect_on_failure=False)
+        disconnected = threading.Event()
+
+        def on_disconnect(client, userdata, flags, reason_code, properties):
+            assert reason_code == ReasonCode(PacketTypes.DISCONNECT, "Not authorized")
+            disconnected.set()
+
+        mqttc.on_disconnect = on_disconnect
+        mqttc.loop_start()
+        try:
+            self._complete_initial_authentication(mqttc, broker)
+            mqttc.reauthenticate(b"reauth-first")
+            assert self._read_packet(broker) == self._auth_packet(25, b"reauth-first")
+            broker.send_packet(paho_test.gen_disconnect(reason_code=135, proto_ver=5))
+            assert disconnected.wait(1)
+            assert not mqttc.is_connected()
+        finally:
+            mqttc.loop_stop()
+            broker.finish()
+
+
 class TestConnectionLost:
+
     def test_with_loop_start(self, fake_broker: FakeBroker):
         mqttc = client.Client(
             CallbackAPIVersion.VERSION1,
