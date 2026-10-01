@@ -18,5 +18,6 @@
    client
    helpers
    types
+   session-persistence
    changelog
    migrations
