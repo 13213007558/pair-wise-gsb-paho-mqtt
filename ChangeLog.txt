@@ -1,3 +1,13 @@
+Unreleased
+==========
+
+- Add optional persistent session storage (`paho.mqtt.sessionstore`): attaching
+  a `SessionStore` (e.g. the included `FileSessionStore`) to `Client` persists
+  the packet id, payload and protocol stage of in-flight QoS 1/2 exchanges, so
+  a process restart can resume them in step with the broker's session instead
+  of losing them. Packet ids are never reused while an exchange is incomplete.
+
+
 v2.1.0 - 2024-04-29
 ===================
 

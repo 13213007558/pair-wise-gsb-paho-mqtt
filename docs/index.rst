@@ -20,3 +20,4 @@
    types
    changelog
    migrations
+   session-persistence

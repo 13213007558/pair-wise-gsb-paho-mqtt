@@ -44,6 +44,7 @@ from .enums import CallbackAPIVersion, ConnackCode, LogLevel, MessageState, Mess
 from .matcher import MQTTMatcher
 from .properties import Properties
 from .reasoncodes import ReasonCode, ReasonCodes
+from .sessionstore import DIRECTION_IN, DIRECTION_OUT, PendingMessage, SessionStore
 from .subscribeoptions import SubscribeOptions
 
 try:
@@ -709,6 +710,16 @@ class Client:
         if applications fails while processing a message, or while it pending
         locally.
 
+    :param SessionStore session_store: optional persistent storage for the QoS 1/2
+        session state (see `paho.mqtt.sessionstore`). When a store is attached, the
+        client persists the packet id, payload and protocol stage of every in-flight
+        QoS 1/2 exchange *before* sending the packet that advances it, so a process
+        restart can resume the exchanges instead of losing them. A packet id is
+        never reused while its previous exchange might still be incomplete.
+        Combine with clean_session=False (MQTT v3) or clean_start=False (MQTT v5)
+        so that the broker also keeps its side of the session. Note that
+        `reinitialise()` does not retain the store.
+
     Callbacks
     =========
 
@@ -755,6 +766,7 @@ class Client:
         transport: Literal["tcp", "websockets", "unix"] = "tcp",
         reconnect_on_failure: bool = True,
         manual_ack: bool = False,
+        session_store: SessionStore | None = None,
     ) -> None:
         transport = transport.lower()  # type: ignore
         if transport == "unix" and not hasattr(socket, "AF_UNIX"):
@@ -890,6 +902,10 @@ class Client:
         # for clean_start == MQTT_CLEAN_START_FIRST_ONLY
         self._mqttv5_first_connect = True
         self.suppress_exceptions = False # For callbacks
+
+        self._session_store = session_store
+        if self._session_store is not None:
+            self._session_store_restore()
 
     def __del__(self) -> None:
         self._reset_sockets()
@@ -1830,6 +1846,9 @@ class Client:
                     elif qos == 2:
                         message.state = mqtt_ms_wait_for_pubrec
 
+                    # Persist the stage before sending PUBLISH so a crash
+                    # after the send still leaves a resumable record.
+                    self._store_save_out(message)
                     rc = self._send_publish(message.mid, topic_bytes, message.payload, message.qos, message.retain,
                                             message.dup, message.info, message.properties)
 
@@ -1837,11 +1856,13 @@ class Client:
                     if rc == MQTTErrorCode.MQTT_ERR_NO_CONN:
                         self._inflight_messages -= 1
                         message.state = mqtt_ms_publish
+                        self._store_save_out(message)
 
                     message.info.rc = rc
                     return message.info
                 else:
                     message.state = mqtt_ms_queued
+                    self._store_save_out(message)
                     message.info.rc = MQTTErrorCode.MQTT_ERR_SUCCESS
                     return message.info
 
@@ -3335,6 +3356,10 @@ class Client:
             self._last_mid += 1
             if self._last_mid == 65536:
                 self._last_mid = 1
+            if self._session_store is not None:
+                # Persist the counter so a restarted process never reuses a
+                # packet id whose previous exchange may be incomplete.
+                self._session_store.set_last_mid(self._last_mid)
             return self._last_mid
 
     @staticmethod
@@ -3771,15 +3796,23 @@ class Client:
                 else:
                     m.state = mqtt_ms_queued
 
+        if self._session_store is not None:
+            for m in self._out_messages.values():
+                self._store_save_out(m)
+
     def _messages_reconnect_reset_in(self) -> None:
         with self._in_message_mutex:
             if self._check_clean_session():
+                if self._session_store is not None:
+                    for mid in self._in_messages:
+                        self._store_remove_in(mid)
                 self._in_messages = collections.OrderedDict()
                 return
             for m in self._in_messages.values():
                 m.timestamp = 0
                 if m.qos != 2:
                     self._in_messages.pop(m.mid)
+                    self._store_remove_in(m.mid)
                 else:
                     # Preserve current state
                     pass
@@ -3787,6 +3820,106 @@ class Client:
     def _messages_reconnect_reset(self) -> None:
         self._messages_reconnect_reset_out()
         self._messages_reconnect_reset_in()
+
+    @staticmethod
+    def _record_from_message(direction: str, message: MQTTMessage) -> PendingMessage:
+        packed_properties = None
+        if message.properties is not None:
+            packed_properties = message.properties.pack()
+        return PendingMessage(
+            direction=direction,
+            mid=message.mid,
+            topic=message._topic,
+            payload=bytes(message.payload),
+            qos=message.qos,
+            retain=message.retain,
+            dup=message.dup,
+            state=message.state,
+            timestamp=message.timestamp,
+            properties=packed_properties,
+        )
+
+    @staticmethod
+    def _message_from_record(record: PendingMessage) -> MQTTMessage:
+        message = MQTTMessage(record.mid, record.topic)
+        message.payload = record.payload
+        message.qos = record.qos
+        message.retain = record.retain
+        message.dup = record.dup
+        message.state = record.state
+        message.timestamp = record.timestamp
+        if record.properties is not None:
+            properties = Properties(PUBLISH >> 4)
+            properties.unpack(record.properties)
+            message.properties = properties
+        return message
+
+    def _store_save_out(self, message: MQTTMessage) -> None:
+        if self._session_store is not None:
+            self._session_store.put(self._record_from_message(DIRECTION_OUT, message))
+
+    def _store_save_in(self, message: MQTTMessage) -> None:
+        if self._session_store is not None:
+            self._session_store.put(self._record_from_message(DIRECTION_IN, message))
+
+    def _store_remove_out(self, mid: int) -> None:
+        if self._session_store is not None:
+            self._session_store.remove(DIRECTION_OUT, mid)
+
+    def _store_remove_in(self, mid: int) -> None:
+        if self._session_store is not None:
+            self._session_store.remove(DIRECTION_IN, mid)
+
+    def _session_store_restore(self) -> None:
+        """Load persisted QoS 1/2 exchanges into the in-memory state.
+
+        Called once from __init__ when a session store is attached. Packet
+        ids of restored exchanges (and the persisted id counter) raise the
+        mid watermark so a live exchange's id is never handed out again.
+        """
+        store = self._session_store
+        if store is None:
+            return
+        store.open(self._client_id.decode("utf-8", "replace"))
+        last_mid = store.get_last_mid()
+        for record in store.load_all():
+            message = self._message_from_record(record)
+            if record.direction == DIRECTION_OUT:
+                self._out_messages[message.mid] = message
+            else:
+                self._in_messages[message.mid] = message
+            if message.mid > last_mid:
+                last_mid = message.mid
+        if last_mid > self._last_mid:
+            self._last_mid = last_mid
+
+    def _session_store_reconcile(self, session_present: bool) -> None:
+        """Align restored QoS 1/2 state with the session the broker kept.
+
+        Called on a successful CONNACK. If the broker has no session for us
+        (we asked for a clean start, or Session Present is not set), an
+        in-flight QoS 2 exchange cannot be resumed mid-way: outbound
+        exchanges that were waiting for PUBCOMP are restarted from PUBLISH
+        (with DUP set, since the broker may have seen the original), and
+        inbound QoS 2 exchanges waiting for PUBREL are dropped (the sender
+        will restart its side of the exchange).
+        """
+        if self._session_store is None:
+            return
+        if session_present and not self._check_clean_session():
+            # The broker kept the session: exchanges resume where they left
+            # off, which is what _messages_reconnect_reset already prepared.
+            return
+        with self._out_message_mutex:
+            for m in self._out_messages.values():
+                if m.qos == 2 and m.state == mqtt_ms_resend_pubrel:
+                    m.state = mqtt_ms_publish
+                    m.dup = True
+                    self._store_save_out(m)
+        with self._in_message_mutex:
+            for mid in [mid for mid, m in self._in_messages.items() if m.qos == 2]:
+                del self._in_messages[mid]
+                self._store_remove_in(mid)
 
     def _packet_queue(
         self,
@@ -3986,6 +4119,9 @@ class Client:
 
         if result == 0:
             rc = MQTTErrorCode.MQTT_ERR_SUCCESS
+            # Reconcile restored session state with the session the broker
+            # actually has before retransmitting anything.
+            self._session_store_reconcile(session_present=(flags & 0x01) != 0)
             with self._out_message_mutex:
                 for m in self._out_messages.values():
                     m.timestamp = time_func()
@@ -4010,6 +4146,7 @@ class Client:
                         if m.state == mqtt_ms_publish:
                             self._inflight_messages += 1
                             m.state = mqtt_ms_wait_for_puback
+                            self._store_save_out(m)
                             with self._in_callback_mutex:  # Don't call loop_write after _send_publish()
                                 rc = self._send_publish(
                                     m.mid,
@@ -4026,6 +4163,7 @@ class Client:
                         if m.state == mqtt_ms_publish:
                             self._inflight_messages += 1
                             m.state = mqtt_ms_wait_for_pubrec
+                            self._store_save_out(m)
                             with self._in_callback_mutex:  # Don't call loop_write after _send_publish()
                                 rc = self._send_publish(
                                     m.mid,
@@ -4041,6 +4179,7 @@ class Client:
                         elif m.state == mqtt_ms_resend_pubrel:
                             self._inflight_messages += 1
                             m.state = mqtt_ms_wait_for_pubcomp
+                            self._store_save_out(m)
                             with self._in_callback_mutex:  # Don't call loop_write after _send_publish()
                                 rc = self._send_pubrel(m.mid)
                             if rc != MQTTErrorCode.MQTT_ERR_SUCCESS:
@@ -4069,6 +4208,9 @@ class Client:
         with self._out_message_mutex:
             retval = list(self._out_messages.values())
             self._out_messages.clear()
+            if self._session_store is not None:
+                for m in retval:
+                    self._store_remove_out(m.mid)
         return retval
 
     def _handle_disconnect(self) -> None:
@@ -4208,12 +4350,15 @@ class Client:
                 return self._send_puback(message.mid)
         elif message.qos == 2:
 
-            rc = self._send_pubrec(message.mid)
-
             message.state = mqtt_ms_wait_for_pubrel
             with self._in_message_mutex:
                 self._in_messages[message.mid] = message
 
+            # Persist before sending PUBREC: once PUBREC is on the wire the
+            # broker may send PUBREL at any time, and a crash in between
+            # must not lose track of this exchange.
+            self._store_save_in(message)
+            rc = self._send_pubrec(message.mid)
             return rc
         else:
             return MQTTErrorCode.MQTT_ERR_PROTOCOL
@@ -4276,6 +4421,12 @@ class Client:
         # is possible that we must known about this message.
         # Choose to acknowledge this message (thus losing a message) but
         # avoid hanging. See #284.
+        # The exchange is complete from our side once PUBCOMP is sent; drop
+        # the persisted record now. If the process crashed between the
+        # on_message delivery above and this removal, the record survives
+        # and the message will be delivered again after a restart (the
+        # documented at-least-once crash window for the application).
+        self._store_remove_in(mid)
         if self._manual_ack:
             return MQTTErrorCode.MQTT_ERR_SUCCESS
         else:
@@ -4291,6 +4442,7 @@ class Client:
                         m.state = mqtt_ms_wait_for_puback
                     elif m.qos == 2:
                         m.state = mqtt_ms_wait_for_pubrec
+                    self._store_save_out(m)
                     rc = self._send_publish(
                         m.mid,
                         m.topic.encode('utf-8'),
@@ -4329,6 +4481,9 @@ class Client:
                 msg = self._out_messages[mid]
                 msg.state = mqtt_ms_wait_for_pubcomp
                 msg.timestamp = time_func()
+                # Persist the new stage before PUBREL goes out; after a
+                # crash the exchange must resume with PUBREL, not PUBLISH.
+                self._store_save_out(msg)
                 return self._send_pubrel(mid)
 
         return MQTTErrorCode.MQTT_ERR_SUCCESS
@@ -4480,6 +4635,7 @@ class Client:
                         raise
 
         msg = self._out_messages.pop(mid)
+        self._store_remove_out(mid)
         msg.info._set_as_published()
         if msg.qos > 0:
             self._inflight_messages -= 1
