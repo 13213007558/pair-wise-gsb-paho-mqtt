@@ -1,0 +1,174 @@
+===== E1 基线: QoS2 + manual_ack=True, PUBCOMP 只在应用 ack() 后发送 =====
+[  0.000s] C->B CONNECT body=00044d5154540402003c000d7365632d6576656e74732d3031
+[  0.000s]  ... (CONNECT clean_session=1)
+[  0.000s] B->C CONNACK(flags=0) hex=20020000
+[  0.000s] APP  on_connect session_present=False rc=Success
+[  0.204s] C->B SUBSCRIBE body=0001000a7365632f6576656e747302
+[  0.204s] B->C SUBACK hex=9003000102
+[  0.409s] B->C PUBLISH(mid=10,qos2) hex=3419000a7365632f6576656e7473000a7b22616c657274223a317d
+[  0.409s] C->B PUBREC body=000a
+[  0.409s]  ... (PUBREC 在 on_message 之前立即发出)
+[  0.409s] B->C PUBREL(mid=10) hex=6202000a
+[  0.409s] APP  on_message 第1次被调用 mid=10 payload=b'{"alert":1}'
+[  1.410s]  ... (静默 1.0s: 客户端未发送任何报文; 回调已返回, 但未 ack => 无 PUBCOMP)
+[  2.211s] APP  应用完成入库, 调用 client.ack(mid=10, qos=2)
+[  2.211s] C->B PUBCOMP body=000a
+[  2.211s] OK   on_message 共 1 次; PUBCOMP 仅在 ack() 后发出
+
+===== E2 重复 PUBLISH (DUP=1, 同 mid): 重发 PUBREC, 不重复回调 =====
+[  0.000s] C->B CONNECT body=00044d5154540402003c000d7365632d6576656e74732d3031
+[  0.000s]  ... (CONNECT clean_session=1)
+[  0.000s] B->C CONNACK(flags=0) hex=20020000
+[  0.000s] APP  on_connect session_present=False rc=Success
+[  0.201s] C->B SUBSCRIBE body=0001000a7365632f6576656e747302
+[  0.201s] B->C SUBACK hex=9003000102
+[  0.402s] B->C PUBLISH(mid=11,qos2,dup=0) hex=3419000a7365632f6576656e7473000b7b22616c657274223a327d
+[  0.402s] C->B PUBREC body=000b
+[  0.402s] B->C PUBLISH(mid=11,qos2,DUP=1) 重传 hex=3c19000a7365632f6576656e7473000b7b22616c657274223a327d
+[  0.402s] C->B PUBREC body=000b
+[  0.907s]  ... (重复 PUBLISH: 再次 PUBREC, on_message 未触发)
+[  0.907s] B->C PUBREL(mid=11) hex=6202000b
+[  0.907s] APP  on_message 第1次被调用 mid=11 payload=b'{"alert":2}'
+[  0.907s] C->B PUBCOMP body=000b
+[  0.907s] OK   on_message 共 1 次
+
+===== E3 重复 PUBREL: 不重复回调; manual_ack 下重传 PUBREL 得不到任何响应 =====
+[  0.000s] C->B CONNECT body=00044d5154540402003c000d7365632d6576656e74732d3031
+[  0.000s]  ... (CONNECT clean_session=1)
+[  0.000s] B->C CONNACK(flags=0) hex=20020000
+[  0.000s] APP  on_connect session_present=False rc=Success
+[  0.201s] C->B SUBSCRIBE body=0001000a7365632f6576656e747302
+[  0.201s] B->C SUBACK hex=9003000102
+[  0.405s] B->C PUBLISH(mid=12,qos2) hex=3419000a7365632f6576656e7473000c7b22616c657274223a337d
+[  0.405s] C->B PUBREC body=000c
+[  0.405s] B->C PUBREL(mid=12) hex=6202000c
+[  0.405s] APP  on_message 第1次被调用 mid=12 payload=b'{"alert":3}'
+[  0.405s] B->C PUBREL(mid=12) 重传#1 hex=6a02000c
+[  1.405s]  ... (静默 1.0s: 客户端未发送任何报文; manual_ack: 重复 PUBREL 无回调也无 PUBCOMP)
+[  1.405s] APP  应用延迟后调用 ack(12, 2)
+[  1.406s] C->B PUBCOMP body=000c
+[  1.406s] B->C PUBREL(mid=12) 重传#2 (ack 之后) hex=6a02000c
+[  2.406s]  ... (静默 1.0s: 客户端未发送任何报文; ack 之后重复 PUBREL 依然静默)
+[  2.406s] OK   on_message 共 1 次
+
+===== E4 断线(PUBREL 之前) + 重连 Session Present=1: 回调仍只一次 =====
+[  0.000s] C->B CONNECT body=00044d5154540400003c000d7365632d6576656e74732d3031
+[  0.000s]  ... (CONNECT clean_session=0)
+[  0.000s] B->C CONNACK(flags=0) hex=20020000
+[  0.000s] APP  on_connect session_present=False rc=Success
+[  0.201s] C->B SUBSCRIBE body=0001000a7365632f6576656e747302
+[  0.201s] B->C SUBACK hex=9003000102
+[  0.405s] B->C PUBLISH(mid=20,qos2) hex=3419000a7365632f6576656e747300147b22616c657274223a347d
+[  0.406s] C->B PUBREC body=0014
+[  0.406s] BROKER 关闭连接（模拟网络断线）
+[  0.406s] APP  on_disconnect rc=Unspecified error
+[  1.408s] C->B CONNECT body=00044d5154540400003c000d7365632d6576656e74732d3031
+[  1.408s]  ... (CONNECT clean_session=0)
+[  1.408s] B->C CONNACK(flags=1) hex=20020100
+[  1.408s] APP  on_connect session_present=True rc=Success
+[  1.609s] B->C PUBLISH(mid=20,qos2,DUP=1) broker 按会话状态重传 hex=3c19000a7365632f6576656e747300147b22616c657274223a347d
+[  1.609s] C->B PUBREC body=0014
+[  1.609s] B->C PUBREL(mid=20) hex=62020014
+[  1.609s] APP  on_message 第1次被调用 mid=20 payload=b'{"alert":4}'
+[  1.609s] C->B PUBCOMP body=0014
+[  1.609s] OK   on_message 共 1 次 (_in_messages 跨重连保留)
+
+===== E5 断线(回调后、ack 前) + 重连 Session Present=1: 不重投, 需应用补 ack =====
+[  0.006s] C->B CONNECT body=00044d5154540400003c000d7365632d6576656e74732d3031
+[  0.006s]  ... (CONNECT clean_session=0)
+[  0.006s] B->C CONNACK(flags=0) hex=20020000
+[  0.009s] APP  on_connect session_present=False rc=Success
+[  0.207s] C->B SUBSCRIBE body=0001000a7365632f6576656e747302
+[  0.207s] B->C SUBACK hex=9003000102
+[  0.410s] B->C PUBLISH(mid=30,qos2) hex=3419000a7365632f6576656e7473001e7b22616c657274223a357d
+[  0.411s] C->B PUBREC body=001e
+[  0.411s] B->C PUBREL(mid=30) hex=6202001e
+[  0.411s] APP  on_message 第1次被调用 mid=30 payload=b'{"alert":5}'
+[  0.411s] APP  回调已执行, 但应用在 ack() 之前断线 (模拟崩溃窗口)
+[  0.411s] BROKER 关闭连接（模拟网络断线）
+[  0.411s] APP  on_disconnect rc=Unspecified error
+[  1.413s] C->B CONNECT body=00044d5154540400003c000d7365632d6576656e74732d3031
+[  1.413s]  ... (CONNECT clean_session=0)
+[  1.413s] B->C CONNACK(flags=1) hex=20020100
+[  1.413s] APP  on_connect session_present=True rc=Success
+[  1.618s] B->C PUBREL(mid=30) broker 重传 hex=6a02001e
+[  2.618s]  ... (静默 1.0s: 客户端未发送任何报文; 消息已交付过: 不再回调, manual_ack 下也不回 PUBCOMP)
+[  2.618s] APP  应用用持久化的 mid 补 ack(30, 2)
+[  2.618s] C->B PUBCOMP body=001e
+[  2.618s] OK   on_message 共 1 次; 若应用丢失 mid, broker 将无限重传 PUBREL
+
+===== E6 断线(回调后、ack 前) + 重连 Session Present=0: 回调第二次执行 (应用层重复!) =====
+[  0.000s] C->B CONNECT body=00044d5154540400003c000d7365632d6576656e74732d3031
+[  0.000s]  ... (CONNECT clean_session=0)
+[  0.000s] B->C CONNACK(flags=0) hex=20020000
+[  0.000s] APP  on_connect session_present=False rc=Success
+[  0.205s] C->B SUBSCRIBE body=0001000a7365632f6576656e747302
+[  0.205s] B->C SUBACK hex=9003000102
+[  0.408s] B->C PUBLISH(mid=40,qos2) hex=3419000a7365632f6576656e747300287b22616c657274223a367d
+[  0.408s] C->B PUBREC body=0028
+[  0.408s] B->C PUBREL(mid=40) hex=62020028
+[  0.408s] APP  on_message 第1次被调用 mid=40 payload=b'{"alert":6}'
+[  0.409s] APP  回调已执行 (假设已入库), 未 ack 即断线
+[  0.409s] BROKER 关闭连接（模拟网络断线）
+[  0.409s] APP  on_disconnect rc=Unspecified error
+[  1.413s] C->B CONNECT body=00044d5154540400003c000d7365632d6576656e74732d3031
+[  1.413s]  ... (CONNECT clean_session=0)
+[  1.413s] B->C CONNACK(flags=0) hex=20020000
+[  1.413s] APP  on_connect session_present=False rc=Success
+[  1.616s]  ... (Session Present=0: broker 没有会话状态, 从头重投 PUBLISH)
+[  1.616s] B->C PUBLISH(mid=40,qos2,DUP=1) hex=3c19000a7365632f6576656e747300287b22616c657274223a367d
+[  1.616s] C->B PUBREC body=0028
+[  1.616s] B->C PUBREL(mid=40) hex=62020028
+[  1.616s] APP  on_message 第2次被调用 mid=40 payload=b'{"alert":6}'
+[  1.616s] C->B PUBCOMP body=0028
+[  1.616s] OK   on_message 共 2 次, mid 相同 => 应用必须自行幂等去重
+
+===== E7 回调抛异常: (a) suppress_exceptions=True 循环存活但不重投; (b) 默认 False 网络线程死亡 =====
+[  0.000s] C->B CONNECT body=00044d5154540402003c000d7365632d6576656e74732d3031
+[  0.000s]  ... (CONNECT clean_session=1)
+[  0.000s] B->C CONNACK(flags=0) hex=20020000
+[  0.000s] APP  on_connect session_present=False rc=Success
+[  0.202s] C->B SUBSCRIBE body=0001000a7365632f6576656e747302
+[  0.202s] B->C SUBACK hex=9003000102
+[  0.406s] B->C PUBLISH(mid=50,qos2) hex=3419000a7365632f6576656e747300327b22616c657274223a377d
+[  0.406s] C->B PUBREC body=0032
+[  0.406s] B->C PUBREL(mid=50) hex=62020032
+[  0.406s] APP  on_message 第1次被调用 mid=50 payload=b'{"alert":7}'
+[  0.406s] APP  on_message 抛出 RuntimeError (suppress_exceptions=True, 已记录日志并吞掉)
+[  0.406s] B->C PUBREL(mid=50) 重传 hex=6a020032
+[  1.407s]  ... (静默 1.0s: 客户端未发送任何报文; 消息在回调前已出队: 不重投, 也不回 PUBCOMP)
+[  1.407s]  ... 网络线程存活=True
+[  1.407s] C->B PUBCOMP body=0032
+[  2.411s] C->B CONNECT body=00044d5154540402003c000d7365632d6576656e74732d3031
+[  2.411s]  ... (CONNECT clean_session=1)
+[  2.411s] B->C CONNACK(flags=0) hex=20020000
+[  2.411s] APP  on_connect session_present=False rc=Success
+[  2.615s] C->B SUBSCRIBE body=0001000a7365632f6576656e747302
+[  2.615s] B->C SUBACK hex=9003000102
+[  2.819s] B->C PUBLISH(mid=51,qos2) hex=341a000a7365632f6576656e747300337b22616c657274223a37627d
+[  2.819s] C->B PUBREC body=0033
+[  2.819s] B->C PUBREL(mid=51) hex=62020033
+[  2.819s] APP  on_message 第1次被调用 mid=51 payload=b'{"alert":7b}'
+[  2.819s] APP  on_message 抛出 RuntimeError (suppress_exceptions=False, 默认)
+[  2.819s]  ... 异常传播 => 网络线程已退出=True (loop_start 模式下客户端停止一切处理)
+[  2.819s] B->C PUBREL(mid=51) 重传 hex=6a020033
+[  3.820s]  ... (静默 1.0s: 客户端未发送任何报文; 线程已死, 无任何响应)
+[  3.820s] OK   回调异常: 消息不重投; 默认配置下整个网络线程终止
+
+===== E8 对照组 manual_ack=False: PUBCOMP 自动发送, 重复 PUBREL 自动重答 =====
+[  0.000s] C->B CONNECT body=00044d5154540402003c000d7365632d6576656e74732d3031
+[  0.000s]  ... (CONNECT clean_session=1)
+[  0.000s] B->C CONNACK(flags=0) hex=20020000
+[  0.000s] APP  on_connect session_present=False rc=Success
+[  0.202s] C->B SUBSCRIBE body=0001000a7365632f6576656e747302
+[  0.202s] B->C SUBACK hex=9003000102
+[  0.403s] B->C PUBLISH(mid=60,qos2) hex=3419000a7365632f6576656e7473003c7b22616c657274223a387d
+[  0.403s] C->B PUBREC body=003c
+[  0.403s] B->C PUBREL(mid=60) hex=6202003c
+[  0.403s] APP  on_message 第1次被调用 mid=60 payload=b'{"alert":8}'
+[  0.403s] C->B PUBCOMP body=003c
+[  0.403s]  ... (回调返回后立即自动 PUBCOMP)
+[  0.403s] B->C PUBREL(mid=60) 重传 hex=6a02003c
+[  0.403s] C->B PUBCOMP body=003c
+[  0.403s]  ... (重复 PUBREL 自动重答 PUBCOMP, 不重复回调)
+[  0.403s] OK   on_message 共 1 次
