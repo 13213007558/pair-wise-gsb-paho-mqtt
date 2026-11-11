@@ -35,6 +35,11 @@ class DisconnectPacket(NamedTuple):
     properties: Properties|None
 
 
+class AuthPacket(NamedTuple):
+    reason: ReasonCode
+    properties: Properties|None
+
+
 class SubackPacket(NamedTuple):
     mid: int
     reason_codes: list[ReasonCode]
@@ -227,6 +232,29 @@ def decode_disconnect(header: int, packet: bytes|bytearray, protocol: MQTTProtoc
             _props, _props_len = properties.unpack(packet[1:])
 
     return DisconnectPacket(
+        reason=reasonCode,
+        properties=properties,
+    )
+
+
+@convert_exception
+def decode_auth(header: int, packet: bytes|bytearray, protocol: MQTTProtocolVersion) -> AuthPacket:
+    """ Decode an AUTH packet (MQTT v5.0 only).
+
+        header is the first bytes of fixed header. packet is everything after
+        the fixed header (e.g. after the remaining length byte(s)).
+    """
+    if len(packet) < 1:
+        raise MalformedPacket("AUTH packet is too small")
+
+    reasonCode = ReasonCode(PacketTypes.AUTH)
+    reasonCode.unpack(packet)
+    properties = None
+    if len(packet) > 1:
+        properties = Properties(PacketTypes.AUTH)
+        _props, _props_len = properties.unpack(packet[1:])
+
+    return AuthPacket(
         reason=reasonCode,
         properties=properties,
     )

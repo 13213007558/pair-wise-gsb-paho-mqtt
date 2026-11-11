@@ -18,6 +18,15 @@ v2.2.0 - 2026-11-xx
 - Various reinforcement against corrupted or malformed packets (Closes #900, #970, #955, #965, #964, #860)
 - Expose ReasonCode names as documentation said (PR #913)
 - Fix broken `reinitialise()` (Closes #824)
+- Add MQTT v5.0 enhanced authentication (AUTH) support through the new
+  `paho.mqtt.auth.AuthController` callback interface, `Client.auth_controller`
+  and `Client.re_authenticate()`, plus the observational `on_auth` callback.
+  The library carries Authentication Method/Data and maintains the protocol
+  state machine (initial authentication and re-authentication) but implements
+  no identity service itself. Authentication Method substitution and
+  out-of-sequence or malformed Authentication Data are rejected, and callback
+  failures or an early peer disconnect never leave the client reported as
+  authenticated.
 
 v2.1.0 - 2024-04-29
 ===================

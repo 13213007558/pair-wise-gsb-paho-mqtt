@@ -33,7 +33,7 @@ class CallbackAPIVersion(enum.Enum):
 
     See each callbacks for details: `on_connect`, `on_connect_fail`, `on_disconnect`, `on_message`, `on_publish`,
     `on_subscribe`, `on_unsubscribe`, `on_log`, `on_socket_open`, `on_socket_close`,
-    `on_socket_register_write`, `on_socket_unregister_write`
+    `on_socket_register_write`, `on_socket_unregister_write`, `on_auth`
     """
     VERSION1 = 1
     """The version used with paho-mqtt 1.x before introducing CallbackAPIVersion.
@@ -111,3 +111,18 @@ class MessageState(enum.IntEnum):
 class PahoClientMode(enum.IntEnum):
     MQTT_CLIENT = 0
     MQTT_BRIDGE = 1
+
+
+class _AuthState(enum.Enum):
+    """Internal state of an MQTT v5.0 enhanced authentication exchange."""
+
+    NONE = enum.auto()
+    # CONNECT with Authentication Method sent, waiting for CONNACK/AUTH.
+    INITIAL_IN_PROGRESS = enum.auto()
+    # Re-authentication started by the client, exchange in progress.
+    REAUTH_IN_PROGRESS = enum.auto()
+    # Re-authentication challenge answered with final Success, waiting for
+    # nothing further (terminal client packet already sent).
+    REAUTH_FINAL_SENT = enum.auto()
+    # Initial authentication completed successfully with the CONNACK.
+    AUTHENTICATED = enum.auto()

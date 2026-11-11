@@ -16,6 +16,7 @@
    :maxdepth: 3
 
    client
+   auth
    helpers
    types
    changelog

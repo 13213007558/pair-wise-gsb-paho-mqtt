@@ -58,7 +58,9 @@ class ReasonCode:
                 "Unspecified error": [PacketTypes.CONNACK, PacketTypes.PUBACK, PacketTypes.PUBREC, PacketTypes.SUBACK, PacketTypes.UNSUBACK, PacketTypes.DISCONNECT],
             },
             129: {"Malformed packet": [PacketTypes.CONNACK, PacketTypes.DISCONNECT]},
-            130: {"Protocol error": [PacketTypes.CONNACK, PacketTypes.DISCONNECT]},
+            # MQTT v5.0 4.12: enhanced authentication failures may also be
+            # carried by AUTH packets, not only CONNACK/DISCONNECT.
+            130: {"Protocol error": [PacketTypes.CONNACK, PacketTypes.DISCONNECT, PacketTypes.AUTH]},
             131: {
                 "Implementation specific error": [
                     PacketTypes.CONNACK,
@@ -73,13 +75,21 @@ class ReasonCode:
             133: {"Client identifier not valid": [PacketTypes.CONNACK]},
             134: {"Bad user name or password": [PacketTypes.CONNACK]},
             135: {
-                "Not authorized": [PacketTypes.CONNACK, PacketTypes.PUBACK, PacketTypes.PUBREC, PacketTypes.SUBACK, PacketTypes.UNSUBACK, PacketTypes.DISCONNECT],
+                "Not authorized": [
+                    PacketTypes.CONNACK,
+                    PacketTypes.PUBACK,
+                    PacketTypes.PUBREC,
+                    PacketTypes.SUBACK,
+                    PacketTypes.UNSUBACK,
+                    PacketTypes.DISCONNECT,
+                    PacketTypes.AUTH,
+                ],
             },
             136: {"Server unavailable": [PacketTypes.CONNACK]},
             137: {"Server busy": [PacketTypes.CONNACK, PacketTypes.DISCONNECT]},
             138: {"Banned": [PacketTypes.CONNACK]},
             139: {"Server shutting down": [PacketTypes.DISCONNECT]},
-            140: {"Bad authentication method": [PacketTypes.CONNACK, PacketTypes.DISCONNECT]},
+            140: {"Bad authentication method": [PacketTypes.CONNACK, PacketTypes.DISCONNECT, PacketTypes.AUTH]},
             141: {"Keep alive timeout": [PacketTypes.DISCONNECT]},
             142: {"Session taken over": [PacketTypes.DISCONNECT]},
             143: {"Topic filter invalid": [PacketTypes.SUBACK, PacketTypes.UNSUBACK, PacketTypes.DISCONNECT]},

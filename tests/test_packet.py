@@ -71,3 +71,35 @@ def test_decode_connack_malformed():
             *split_full_packet(b"\x20\x03\x00\x00\x80"),
             MQTTProtocolVersion.MQTTv5,
         )
+
+
+def test_decode_auth_continue():
+    from paho.mqtt import _packet
+    method_prop = b"\x15\x00\x09FAKE-AUTH"
+    data_prop = b"\x16\x00\x03abc"
+    props = b"\x12" + method_prop + data_prop
+    packet = b"\xf0" + bytes([1 + len(props)]) + b"\x18" + props
+    result = _packet.decode_auth(
+        *split_full_packet(packet), MQTTProtocolVersion.MQTTv5
+    )
+    assert result.reason.value == 24
+    assert result.properties.AuthenticationMethod == "FAKE-AUTH"
+    assert result.properties.AuthenticationData == b"abc"
+
+
+def test_decode_auth_success_no_properties():
+    from paho.mqtt import _packet
+    packet = b"\xf0\x02\x00\x00"
+    result = _packet.decode_auth(
+        *split_full_packet(packet), MQTTProtocolVersion.MQTTv5
+    )
+    assert result.reason.value == 0
+    assert result.properties.isEmpty()
+
+
+def test_decode_auth_malformed():
+    from paho.mqtt import _packet
+    with pytest.raises(MalformedPacket):
+        _packet.decode_auth(
+            *split_full_packet(b"\xf0\x00"), MQTTProtocolVersion.MQTTv5
+        )

@@ -263,8 +263,52 @@ The following callbacks exists:
 * `on_unsubscribe()`: called when the UNSUBACK is received from the broker
 * `on_log()`: called when the library log a message
 * `on_socket_open`, `on_socket_close`, `on_socket_register_write`, `on_socket_unregister_write`: callbacks used for external loop support. See below for details.
+* `on_auth()`: (MQTT v5.0 only) observational callback fired for every AUTH packet received during an enhanced authentication exchange. It only notifies; the authentication algorithm itself is provided by an `paho.mqtt.auth.AuthController`.
 
 For the signature of each callback, see the `online documentation <documentation_>`_.
+
+MQTT v5.0 enhanced authentication
+`````````````````````````````````
+
+Enhanced authentication (MQTT v5.0 section 4.12) is supported through the
+`paho.mqtt.auth` module. The library does **not** implement any authentication
+algorithm or identity service: it only carries the ``Authentication Method``
+and ``Authentication Data`` properties, sends the correct AUTH packets and
+maintains the protocol state machine. You provide an
+`paho.mqtt.auth.AuthController` subclass implementing the challenge/response
+algorithm and attach it before connecting::
+
+    from paho.mqtt.auth import AuthController, AuthResult
+
+    class MyAuthenticator(AuthController):
+        method = "MY-AUTH-METHOD"
+
+        def initial_authentication(self, client, userdata):
+            return AuthResult(data=b"initial-material")
+
+        def handle_challenge(self, client, userdata, phase, data, properties):
+            return AuthResult(data=compute_response(data))
+
+    mqttc.auth_controller = MyAuthenticator()
+    mqttc.connect(...)
+
+Two lifecycles are distinguished by `paho.mqtt.auth.AuthPhase`:
+
+* ``INITIAL``: the exchange runs as part of connection establishment. The
+  connection is only reported as connected/authenticated once the controller's
+  ``handle_success`` accepts the successful CONNACK.
+* ``REAUTHENTICATE``: an exchange started on an established connection with
+  ``mqttc.re_authenticate()``. The existing connection keeps working until the
+  exchange finishes.
+
+The Authentication Method cannot be replaced by the server in the middle of an
+exchange, and out-of-sequence or malformed Authentication Data is rejected as a
+protocol error. A controller exception, a rejected challenge or the peer
+closing the transport all abort the exchange and never leave the client
+reporting itself as authenticated. See the docstrings of each
+`paho.mqtt.auth.AuthController` method for the values each callback may return,
+and ``examples/enhanced_authentication.py`` for a deterministic demonstration
+of success, failure and multi-step re-authentication.
 
 Subscriber example
 ''''''''''''''''''

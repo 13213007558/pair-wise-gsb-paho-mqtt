@@ -39,10 +39,32 @@ from collections.abc import Iterator, Sequence
 from typing import TYPE_CHECKING, Any, Callable, NamedTuple, Union, cast, overload
 
 from paho.mqtt import _packet
+from paho.mqtt.auth import (
+    AUTH_REASON_CONTINUE,
+    AUTH_REASON_REAUTHENTICATE,
+    AUTH_REASON_SUCCESS,
+    AuthController,
+    AuthError,
+    AuthPhase,
+    AuthResult,
+    is_auth_failure,
+    make_auth_reason_code,
+)
 from paho.mqtt.exception import MalformedPacket
 from paho.mqtt.packettypes import PacketTypes
 
-from .enums import CallbackAPIVersion, ConnackCode, LogLevel, MessageState, MessageType, MQTTErrorCode, MQTTProtocolVersion, PahoClientMode, _ConnectionState
+from .enums import (
+    CallbackAPIVersion,
+    ConnackCode,
+    LogLevel,
+    MessageState,
+    MessageType,
+    MQTTErrorCode,
+    MQTTProtocolVersion,
+    PahoClientMode,
+    _AuthState,
+    _ConnectionState,
+)
 from .matcher import MQTTMatcher
 from .properties import Properties
 from .reasoncodes import ReasonCode, ReasonCodes
@@ -278,6 +300,12 @@ CallbackOnUnsubscribe_v1_mqtt5 = Callable[["Client", Any, int, Properties, Union
 CallbackOnUnsubscribe_v1 = Union[CallbackOnUnsubscribe_v1_mqtt3, CallbackOnUnsubscribe_v1_mqtt5]
 CallbackOnUnsubscribe_v2 = Callable[["Client", Any, int, list[ReasonCode], Union[Properties, None]], None]
 CallbackOnUnsubscribe = Union[CallbackOnUnsubscribe_v1, CallbackOnUnsubscribe_v2]
+# Notification callback fired for every AUTH packet received during an
+# enhanced authentication exchange. It is purely observational; the challenge
+# algorithm itself lives in the AuthController. Return value is ignored.
+CallbackOnAuth = Callable[
+    ["Client", Any, AuthPhase, ReasonCode, Union[Properties, None]], None
+]
 
 # This is needed for typing because class Client redefined the name "socket"
 _socket = socket
@@ -859,6 +887,15 @@ class Client:
         self._on_socket_close: CallbackOnSocket | None = None
         self._on_socket_register_write: CallbackOnSocket | None = None
         self._on_socket_unregister_write: CallbackOnSocket | None = None
+        self._on_auth: CallbackOnAuth | None = None
+        # MQTT v5.0 enhanced authentication. The algorithm is fully owned by the
+        # application through an AuthController; the library only carries the
+        # AUTH packets and maintains the state machine.
+        self._auth_controller: AuthController | None = None
+        self._auth_state: _AuthState = _AuthState.NONE
+        # Authentication Method in use for the current/last exchange. It cannot
+        # change in the middle of an exchange (MQTT v5.0 4.12.1).
+        self._auth_method: bytes | None = None
         self._websocket_path = "/mqtt"
         self._websocket_extra_headers: WebSocketHeaders | None = None
         # for clean_start == MQTT_CLEAN_START_FIRST_ONLY
@@ -1554,6 +1591,8 @@ class Client:
 
         self._ping_t = 0.0
         self._state = _ConnectionState.MQTT_CS_CONNECTING
+        # A new connection starts a fresh enhanced authentication lifecycle.
+        self._auth_reset()
 
         self._sock_close()
 
@@ -2984,6 +3023,102 @@ class Client:
                 if not self.suppress_exceptions:
                     raise
 
+    @property
+    def auth_controller(self) -> AuthController | None:
+        """The application provided MQTT v5.0 enhanced authentication
+        controller, or ``None`` if enhanced authentication is not used.
+
+        Set it to an `paho.mqtt.auth.AuthController` instance to enable
+        enhanced authentication (MQTT v5.0 only). The Authentication Method is
+        taken from the controller's ``method`` attribute and cannot be replaced
+        by the server in the middle of an exchange. It may only be changed while
+        no connection is open and no exchange is in progress.
+        """
+        return self._auth_controller
+
+    @auth_controller.setter
+    def auth_controller(self, controller: AuthController | None) -> None:
+        if controller is not None and not isinstance(controller, AuthController):
+            raise TypeError(
+                "auth_controller must be an instance of "
+                "paho.mqtt.auth.AuthController or None")
+        if controller is not None and not getattr(controller, "method", ""):
+            raise ValueError(
+                "AuthController.method must be a non-empty Authentication "
+                "Method name")
+        if controller is not None and self._protocol != MQTTv5:
+            raise AuthError(
+                "Enhanced authentication is only available with MQTT v5.0")
+        if not self._connection_closed():
+            raise RuntimeError(
+                "updating the authentication controller on an established "
+                "connection is not supported")
+        with self._callback_mutex:
+            self._auth_controller = controller
+            self._auth_state = _AuthState.NONE
+            self._auth_method = None
+
+    def authenticate(self, controller: AuthController) -> None:
+        """Enable MQTT v5.0 enhanced authentication using ``controller``.
+
+        Equivalent to assigning ``client.auth_controller = controller``. It
+        must be called before `connect()`; enhanced authentication then runs as
+        part of every connection establishment, and `re_authenticate()` becomes
+        available once connected.
+
+        :param AuthController controller: application object implementing the
+            authentication algorithm. The library does not implement any
+            identity service itself.
+        """
+        self.auth_controller = controller
+
+    @property
+    def on_auth(self) -> CallbackOnAuth | None:
+        """Observational callback fired for every AUTH packet received during
+        an enhanced authentication exchange.
+
+        This callback does not drive the authentication algorithm — that is the
+        role of the `paho.mqtt.auth.AuthController` — it only notifies the
+        application that an AUTH packet arrived, which is useful for logging
+        and diagnostics.
+
+        Expected signature is (for all callback API versions)::
+
+            on_auth(client, userdata, phase, reason_code, properties)
+
+        :param Client client: the client instance for this callback
+        :param userdata: the private user data as set in Client() or
+            user_data_set()
+        :param AuthPhase phase: `AuthPhase.INITIAL` during connection
+            establishment or `AuthPhase.REAUTHENTICATE` for an exchange started
+            on an established connection.
+        :param ReasonCode reason_code: the reason code of the received AUTH
+            packet (``Continue authentication``, ``Success`` or a failure
+            code).
+        :param Properties properties: the MQTT v5.0 properties of the AUTH
+            packet, or ``None`` if it carried none.
+
+        The return value is ignored. Raising an exception is logged (and
+        re-raised unless ``suppress_exceptions`` is set) but does not alter the
+        state machine, which is driven solely by the AuthController.
+
+        Decorator: @client.auth_callback()
+        """
+        return self._on_auth
+
+    @on_auth.setter
+    def on_auth(self, func: CallbackOnAuth | None) -> None:
+        with self._callback_mutex:
+            self._on_auth = func
+
+    def auth_callback(
+        self,
+    ) -> Callable[[CallbackOnAuth], CallbackOnAuth]:
+        def decorator(func: CallbackOnAuth) -> CallbackOnAuth:
+            self.on_auth = func
+            return func
+        return decorator
+
     def message_callback_add(self, sub: str, callback: CallbackOnMessage) -> None:
         """Register a message callback for a specific topic.
         Messages that match 'sub' will be passed to 'callback'. Any
@@ -3478,6 +3613,38 @@ class Client:
         packet = struct.pack('!BB', command, remaining_length)
         return self._packet_queue(command, packet, 0, 0)
 
+    def _auth_reset(self) -> None:
+        """Reset the enhanced authentication state machine for a new attempt."""
+        self._auth_state = (
+            _AuthState.NONE if self._auth_controller is None
+            else _AuthState.INITIAL_IN_PROGRESS
+        )
+        self._auth_method = None
+
+    def _connect_properties_with_auth(
+        self, initial: AuthResult
+    ) -> Properties | None:
+        """Return the CONNECT properties, adding enhanced authentication ones.
+
+        A copy is produced so the user-supplied ``connect properties`` object
+        is never mutated.
+        """
+        if self._connect_properties is None:
+            props = Properties(PacketTypes.CONNECT)
+        else:
+            props = Properties(PacketTypes.CONNECT)
+            for name in self._connect_properties.names:
+                compressed = name.replace(' ', '')
+                if hasattr(self._connect_properties, compressed):
+                    setattr(props, name, getattr(self._connect_properties, compressed))
+        controller = self._auth_controller
+        assert controller is not None
+        props.AuthenticationMethod = controller.method
+        self._auth_method = _force_bytes(controller.method)
+        if initial.data is not None:
+            props.AuthenticationData = bytes(initial.data)
+        return props
+
     def _send_connect(self, keepalive: int) -> MQTTErrorCode:
         proto_ver = int(self._protocol)
         # hard-coded UTF-8 encoded string
@@ -3507,10 +3674,19 @@ class Client:
                 remaining_length += 2 + len(self._password)
 
         if self._protocol == MQTTv5:
-            if self._connect_properties is None:
+            effective_connect_properties = self._connect_properties
+            if self._auth_controller is not None:
+                initial_result = self._auth_start_initial()
+                if initial_result is None:
+                    # The application refused to start authentication: abort the
+                    # connection without sending a CONNECT.
+                    return MQTTErrorCode.MQTT_ERR_AUTH
+                effective_connect_properties = self._connect_properties_with_auth(
+                    initial_result)
+            if effective_connect_properties is None:
                 packed_connect_properties = b'\x00'
             else:
-                packed_connect_properties = self._connect_properties.pack()
+                packed_connect_properties = effective_connect_properties.pack()
             remaining_length += len(packed_connect_properties)
             if self._will:
                 if self._will_properties is None:
@@ -3580,6 +3756,369 @@ class Client:
                 self._client_id
             )
         return self._packet_queue(command, packet, 0, 0)
+
+    # ------------------------------------------------------------------
+    # MQTT v5.0 enhanced authentication
+    #
+    # The library only carries Authentication Method/Data between the server
+    # and the application's AuthController and maintains the state machine.
+    # No authentication algorithm or identity service is implemented here.
+    # ------------------------------------------------------------------
+
+    def _auth_phase(self) -> AuthPhase:
+        if self._auth_state == _AuthState.REAUTH_IN_PROGRESS \
+                or self._auth_state == _AuthState.REAUTH_FINAL_SENT:
+            return AuthPhase.REAUTHENTICATE
+        return AuthPhase.INITIAL
+
+    def _auth_start_initial(self) -> AuthResult | None:
+        """Invoke the controller to build the CONNECT auth material."""
+        controller = self._auth_controller
+        assert controller is not None
+        self._auth_state = _AuthState.INITIAL_IN_PROGRESS
+        try:
+            result = controller.initial_authentication(self, self._userdata)
+        except Exception as err:  # noqa: BLE001
+            self._easy_log(
+                MQTT_LOG_ERR,
+                "Enhanced authentication refused to start: %s", err)
+            self._auth_fail_local(AuthPhase.INITIAL)
+            return None
+        if result is None:
+            result = AuthResult()
+        if result.reason_code is not None and is_auth_failure(result.reason_code):
+            self._easy_log(
+                MQTT_LOG_ERR,
+                "Enhanced authentication refused to start with reason %s",
+                result.reason_code)
+            self._auth_fail_local(AuthPhase.INITIAL)
+            return None
+        return result
+
+    def _auth_fail_local(self, phase: AuthPhase) -> None:
+        """Terminate an exchange refused/failed by the local controller."""
+        self._auth_state = _AuthState.NONE
+        # Never leave the client believing it is authenticated.
+        if self._state == _ConnectionState.MQTT_CS_CONNECTED:
+            self._sock_close()
+            self._do_on_disconnect(
+                packet_from_broker=False,
+                v1_rc=MQTTErrorCode.MQTT_ERR_AUTH,
+            )
+            self._state = _ConnectionState.MQTT_CS_CONNECTION_LOST
+        else:
+            self._sock_close()
+            self._state = _ConnectionState.MQTT_CS_CONNECTION_LOST
+
+    def _auth_protocol_violation(self, detail: str) -> MQTTErrorCode:
+        """Reject a packet that does not fit the authentication state machine."""
+        self._easy_log(
+            MQTT_LOG_ERR,
+            "Enhanced authentication protocol error: %s", detail)
+        self._auth_state = _AuthState.NONE
+        self._sock_close()
+        if self._state == _ConnectionState.MQTT_CS_CONNECTED:
+            self._do_on_disconnect(
+                packet_from_broker=False,
+                v1_rc=MQTTErrorCode.MQTT_ERR_PROTOCOL,
+            )
+            self._state = _ConnectionState.MQTT_CS_CONNECTION_LOST
+        else:
+            self._state = _ConnectionState.MQTT_CS_CONNECTION_LOST
+        return MQTTErrorCode.MQTT_ERR_PROTOCOL
+
+    def _check_auth_method(self, properties: Properties | None) -> MQTTErrorCode | None:
+        """Enforce a constant Authentication Method across the exchange.
+
+        Returns an error code if the packet is invalid, otherwise ``None``.
+        """
+        method = getattr(properties, "AuthenticationMethod", None) \
+            if properties is not None else None
+        if method is None:
+            # Authentication Data without an Authentication Method is invalid
+            # (MQTT v5.0 3.15.3 / 4.12.1).
+            if properties is not None and hasattr(properties, "AuthenticationData"):
+                return self._auth_protocol_violation(
+                    "Authentication Data present without Authentication Method")
+            return None
+        method_bytes = _force_bytes(method)
+        if self._auth_method is not None and method_bytes != self._auth_method:
+            return self._auth_protocol_violation(
+                "Authentication Method changed in the middle of the exchange")
+        self._auth_method = method_bytes
+        return None
+
+    def _send_auth(
+        self,
+        reason_code: ReasonCode,
+        data: bytes | bytearray | None = None,
+    ) -> MQTTErrorCode:
+        controller = self._auth_controller
+        if controller is None or self._auth_method is None:
+            return MQTTErrorCode.MQTT_ERR_PROTOCOL
+
+        properties = Properties(PacketTypes.AUTH)
+        # The Authentication Method must be present on every AUTH packet.
+        properties.AuthenticationMethod = self._auth_method.decode("utf-8")
+        if data is not None:
+            properties.AuthenticationData = bytes(data)
+
+        remaining_length = 1 + len(properties.pack())
+        packet = bytearray()
+        packet.append(AUTH)
+        self._pack_remaining_length(packet, remaining_length)
+        packet += reason_code.pack()
+        packet += properties.pack()
+
+        self._easy_log(
+            MQTT_LOG_DEBUG,
+            "Sending AUTH reasonCode=%s properties=%s", reason_code, properties)
+        return self._packet_queue(AUTH, packet, 0, 0)
+
+    def re_authenticate(self) -> MQTTErrorCode:
+        """Start re-authentication on an established MQTT v5.0 connection.
+
+        The first client AUTH packet uses the ``Re-authenticate`` reason code
+        and the Authentication Method/Data provided by the configured
+        `AuthController`. The connection keeps operating until the exchange
+        completes; it is only considered re-authenticated after the controller's
+        success callback has run without error.
+
+        :raises AuthError: if enhanced authentication is not configured, the
+            protocol is not MQTT v5.0, the client is not connected, or another
+            exchange is already in progress.
+        """
+        if self._protocol != MQTTv5:
+            raise AuthError("Enhanced authentication requires MQTT v5.0")
+        if self._auth_controller is None:
+            raise AuthError(
+                "No AuthController configured; set client.auth_controller "
+                "before connecting")
+        if not self.is_connected():
+            raise AuthError(
+                "re_authenticate() requires an established connection")
+        if self._auth_state in (
+            _AuthState.INITIAL_IN_PROGRESS,
+            _AuthState.REAUTH_IN_PROGRESS,
+            _AuthState.REAUTH_FINAL_SENT,
+        ):
+            raise AuthError("An authentication exchange is already in progress")
+
+        controller = self._auth_controller
+        self._auth_state = _AuthState.REAUTH_IN_PROGRESS
+        try:
+            result = controller.re_authentication(self, self._userdata)
+        except Exception as err:  # noqa: BLE001
+            self._easy_log(
+                MQTT_LOG_ERR, "Re-authentication failed to start: %s", err)
+            self._auth_fail_local(AuthPhase.REAUTHENTICATE)
+            return MQTTErrorCode.MQTT_ERR_AUTH
+        if result is None:
+            result = AuthResult()
+        if result.reason_code is not None and is_auth_failure(result.reason_code):
+            self._easy_log(
+                MQTT_LOG_ERR,
+                "Re-authentication refused locally: %s", result.reason_code)
+            self._auth_fail_local(AuthPhase.REAUTHENTICATE)
+            return MQTTErrorCode.MQTT_ERR_AUTH
+
+        reason = result.reason_code
+        if reason is None:
+            reason = make_auth_reason_code(AUTH_REASON_REAUTHENTICATE)
+        elif reason.packetType != PacketTypes.AUTH or reason.value != AUTH_REASON_REAUTHENTICATE:
+            self._easy_log(
+                MQTT_LOG_ERR,
+                "Invalid reason code for re-authentication start: %s", reason)
+            self._auth_fail_local(AuthPhase.REAUTHENTICATE)
+            return MQTTErrorCode.MQTT_ERR_AUTH
+        rc = self._send_auth(reason, result.data)
+        if rc != MQTTErrorCode.MQTT_ERR_SUCCESS:
+            self._auth_fail_local(AuthPhase.REAUTHENTICATE)
+        return rc
+
+    def _handle_auth(self) -> MQTTErrorCode:
+        if self._protocol != MQTTv5 or self._auth_controller is None:
+            return self._auth_protocol_violation(
+                "AUTH packet received without enhanced authentication enabled")
+
+        result = _packet.decode_auth(
+            self._in_packet["command"],
+            self._in_packet["packet"],
+            self._protocol,
+        )
+        reason = result.reason
+        properties = result.properties
+        controller = self._auth_controller
+        phase = self._auth_phase()
+
+        self._easy_log(
+            MQTT_LOG_DEBUG, "Received AUTH %s properties=%s", reason, properties)
+
+        if self._auth_state not in (
+            _AuthState.INITIAL_IN_PROGRESS,
+            _AuthState.REAUTH_IN_PROGRESS,
+            _AuthState.REAUTH_FINAL_SENT,
+        ):
+            return self._auth_protocol_violation(
+                "AUTH packet received outside of an authentication exchange")
+
+        violation = self._check_auth_method(properties)
+        if violation is not None:
+            return violation
+
+        self._call_on_auth(phase, reason, properties)
+
+        data = getattr(properties, "AuthenticationData", None) \
+            if properties is not None else None
+
+        if reason.value == AUTH_REASON_CONTINUE:
+            return self._auth_handle_continue(phase, data, properties)
+        if reason.value == AUTH_REASON_SUCCESS:
+            # During initial authentication success is signalled solely by the
+            # successful CONNACK; an AUTH Success here is out of sequence.
+            if phase == AuthPhase.INITIAL:
+                return self._auth_protocol_violation(
+                    "AUTH Success received during initial authentication; "
+                    "success must be carried by CONNACK")
+            return self._auth_handle_success(phase, data, properties)
+        if is_auth_failure(reason):
+            return self._auth_handle_server_failure(phase, reason, properties)
+        return self._auth_protocol_violation(
+            f"unexpected AUTH reason code {reason.value}")
+
+    def _auth_handle_continue(
+        self,
+        phase: AuthPhase,
+        data: bytes | None,
+        properties: Properties | None,
+    ) -> MQTTErrorCode:
+        if self._auth_state == _AuthState.REAUTH_FINAL_SENT:
+            return self._auth_protocol_violation(
+                "Continue authentication received after final Success")
+        controller = self._auth_controller
+        assert controller is not None
+        try:
+            result = controller.handle_challenge(
+                self, self._userdata, phase, data, properties)
+        except Exception as err:  # noqa: BLE001
+            self._easy_log(
+                MQTT_LOG_ERR,
+                "Exception in handle_challenge, aborting: %s", err)
+            self._auth_fail_local(phase)
+            if not self.suppress_exceptions:
+                raise
+            return MQTTErrorCode.MQTT_ERR_AUTH
+        if result is None:
+            result = AuthResult()
+        if result.reason_code is not None and is_auth_failure(result.reason_code):
+            self._easy_log(
+                MQTT_LOG_ERR,
+                "Challenge rejected by controller: %s", result.reason_code)
+            self._auth_fail_local(phase)
+            return MQTTErrorCode.MQTT_ERR_AUTH
+        reason = result.reason_code
+        if reason is None:
+            reason = make_auth_reason_code(AUTH_REASON_CONTINUE)
+        elif reason.packetType != PacketTypes.AUTH or is_auth_failure(reason):
+            return self._auth_protocol_violation(
+                f"invalid AUTH reason code from controller: {reason}")
+        return self._send_auth(reason, result.data)
+
+    def _auth_handle_success(
+        self,
+        phase: AuthPhase,
+        data: bytes | None,
+        properties: Properties | None,
+    ) -> MQTTErrorCode:
+        controller = self._auth_controller
+        assert controller is not None
+        try:
+            result = controller.handle_success(
+                self, self._userdata, phase, data, properties)
+        except Exception as err:  # noqa: BLE001
+            self._easy_log(
+                MQTT_LOG_ERR,
+                "Exception in handle_success, aborting: %s", err)
+            self._auth_fail_local(phase)
+            if not self.suppress_exceptions:
+                raise
+            return MQTTErrorCode.MQTT_ERR_AUTH
+        if isinstance(result, AuthResult) and result.reason_code is not None \
+                and is_auth_failure(result.reason_code):
+            self._easy_log(
+                MQTT_LOG_ERR,
+                "Success rejected by controller: %s", result.reason_code)
+            self._auth_fail_local(phase)
+            return MQTTErrorCode.MQTT_ERR_AUTH
+
+        if phase == AuthPhase.INITIAL:
+            # The successful CONNACK is the terminal initial packet; nothing
+            # more is sent here. _handle_connack finalises the connection.
+            self._auth_state = _AuthState.AUTHENTICATED
+            return MQTTErrorCode.MQTT_ERR_SUCCESS
+
+        # Re-authentication: optionally emit a final client Success.
+        outgoing_data = result.data if isinstance(result, AuthResult) else None
+        self._auth_state = _AuthState.REAUTH_FINAL_SENT
+        rc = self._send_auth(
+            make_auth_reason_code(AUTH_REASON_SUCCESS), outgoing_data)
+        if rc == MQTTErrorCode.MQTT_ERR_SUCCESS:
+            self._auth_state = _AuthState.AUTHENTICATED
+            self._easy_log(
+                MQTT_LOG_DEBUG, "Re-authentication completed successfully")
+        else:
+            self._auth_fail_local(phase)
+        return rc
+
+    def _auth_handle_server_failure(
+        self,
+        phase: AuthPhase,
+        reason: ReasonCode,
+        properties: Properties | None,
+    ) -> MQTTErrorCode:
+        controller = self._auth_controller
+        assert controller is not None
+        self._easy_log(
+            MQTT_LOG_ERR,
+            "Enhanced authentication failed by server: %s", reason)
+        try:
+            controller.handle_failure(
+                self, self._userdata, phase, reason, properties)
+        except Exception as err:  # noqa: BLE001
+            self._easy_log(
+                MQTT_LOG_ERR, "Exception in handle_failure: %s", err)
+            if not self.suppress_exceptions:
+                raise
+        self._auth_state = _AuthState.NONE
+        self._sock_close()
+        if self._state == _ConnectionState.MQTT_CS_CONNECTED:
+            self._do_on_disconnect(
+                packet_from_broker=False,
+                v1_rc=MQTTErrorCode.MQTT_ERR_AUTH,
+            )
+            self._state = _ConnectionState.MQTT_CS_CONNECTION_LOST
+        else:
+            self._state = _ConnectionState.MQTT_CS_CONNECTION_LOST
+        return MQTTErrorCode.MQTT_ERR_AUTH
+
+    def _call_on_auth(
+        self,
+        phase: AuthPhase,
+        reason: ReasonCode,
+        properties: Properties | None,
+    ) -> None:
+        with self._callback_mutex:
+            on_auth = self.on_auth
+        if on_auth is None:
+            return
+        with self._in_callback_mutex:
+            try:
+                on_auth(self, self._userdata, phase, reason, properties)
+            except Exception as err:  # noqa: BLE001
+                self._easy_log(
+                    MQTT_LOG_ERR, 'Caught exception in on_auth: %s', err)
+                if not self.suppress_exceptions:
+                    raise
 
     def _send_disconnect(
         self,
@@ -3825,6 +4364,8 @@ class Client:
         elif cmd == DISCONNECT and self._protocol == MQTTv5:  # only allowed in MQTT 5.0
             self._handle_disconnect()
             return MQTTErrorCode.MQTT_ERR_SUCCESS
+        elif cmd == AUTH and self._protocol == MQTTv5:  # only allowed in MQTT 5.0
+            return self._handle_auth()
         else:
             # If we don't recognise the command, return an error straight away.
             self._easy_log(MQTT_LOG_ERR, "Error: Unrecognised command %s", cmd)
@@ -3859,6 +4400,37 @@ class Client:
             # CONNACK, the client must use that value instead of the one
             # it sent (MQTT 5.0 spec 3.2.2.3.14).
             self._keepalive = properties.ServerKeepAlive
+
+        # MQTT v5.0 enhanced authentication: a CONNACK is the terminal packet of
+        # the initial authentication lifecycle. Reject Authentication Method
+        # substitution and out-of-sequence data, and only report the connection
+        # as authenticated once the controller's success callback accepts it.
+        if self._protocol == MQTTv5 and self._auth_controller is not None:
+            if self._auth_state != _AuthState.INITIAL_IN_PROGRESS:
+                return self._auth_protocol_violation(
+                    "CONNACK received outside of initial authentication")
+            violation = self._check_auth_method(properties)
+            if violation is not None:
+                return violation
+            if connack_rc == 0:
+                auth_data = getattr(properties, "AuthenticationData", None)
+                auth_rc = self._auth_handle_success(
+                    AuthPhase.INITIAL, auth_data, properties)
+                if auth_rc != MQTTErrorCode.MQTT_ERR_SUCCESS:
+                    return auth_rc
+            else:
+                reason_failure = ReasonCode(
+                    PacketTypes.CONNACK, identifier=connack_rc)
+                return self._auth_handle_server_failure(
+                    AuthPhase.INITIAL, reason_failure, properties)
+        elif self._protocol == MQTTv5 and properties is not None and (
+                hasattr(properties, "AuthenticationMethod")
+                or hasattr(properties, "AuthenticationData")):
+            # Server introduced authentication properties without the client
+            # requesting enhanced authentication: protocol violation.
+            return self._auth_protocol_violation(
+                "CONNACK carries authentication properties but no enhanced "
+                "authentication was requested")
 
         if self._protocol == MQTTv311:
             if connack_rc == CONNACK_REFUSED_PROTOCOL_VERSION:
@@ -4313,6 +4885,9 @@ class Client:
         reason: ReasonCode | None = None,
         properties: Properties | None = None,
     ) -> None:
+        # Any in-progress enhanced authentication is aborted by the loss of the
+        # transport; it must never be considered authenticated afterwards.
+        self._auth_state = _AuthState.NONE
         with self._callback_mutex:
             on_disconnect = self.on_disconnect
 
