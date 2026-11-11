@@ -814,6 +814,10 @@ class Client:
         self._in_messages: collections.OrderedDict[
             int, MQTTMessage
         ] = collections.OrderedDict()
+        # MQTTv5 topic alias mapping (alias -> topic) for inbound PUBLISH
+        # packets. It is scoped to the current network connection and must
+        # be reset on every (re)connect, even if the session is resumed.
+        self._in_topic_alias: dict[int, bytes] = {}
         self._max_inflight_messages = 20
         self._inflight_messages = 0
         self._max_queued_messages = 0
@@ -1551,6 +1555,11 @@ class Client:
             "to_process": 0,
             "pos": 0,
         }
+
+        # Topic alias mappings only live for the duration of a network
+        # connection: they must not be reused across a reconnect, even when
+        # the session is resumed.
+        self._in_topic_alias.clear()
 
         self._ping_t = 0.0
         self._state = _ConnectionState.MQTT_CS_CONNECTING
@@ -4096,6 +4105,58 @@ class Client:
                     if not self.suppress_exceptions:
                         raise
 
+    def _resolve_topic_alias(self, message: MQTTMessage) -> MQTTErrorCode:
+        """Resolve the MQTTv5 topic alias of an inbound PUBLISH packet.
+
+        On success ``message.topic`` is the resolved topic, so ``on_message``
+        and topic-filtered callbacks always see the full topic rather than
+        the (possibly empty) topic sent on the wire. Invalid packets (alias
+        0, alias above the TopicAliasMaximum we declared in CONNECT, empty
+        topic referencing an unknown alias) are a protocol error and must
+        not be delivered to the application.
+        """
+        properties = message.properties
+        alias = getattr(properties, "TopicAlias", None) if properties is not None else None
+        if alias is None:
+            if len(message._topic) == 0:
+                self._easy_log(
+                    MQTT_LOG_ERR,
+                    "Received PUBLISH with an empty topic and no Topic Alias",
+                )
+                return MQTTErrorCode.MQTT_ERR_PROTOCOL
+            return MQTTErrorCode.MQTT_ERR_SUCCESS
+
+        # The server may only use aliases up to the TopicAliasMaximum we
+        # sent in CONNECT (absent means 0, i.e. aliases are not allowed).
+        max_alias = 0
+        if self._connect_properties is not None:
+            max_alias = getattr(self._connect_properties, "TopicAliasMaximum", 0)
+
+        if alias == 0 or alias > max_alias:
+            self._easy_log(
+                MQTT_LOG_ERR,
+                "Received PUBLISH with invalid Topic Alias %d (maximum is %d)",
+                alias, max_alias,
+            )
+            return MQTTErrorCode.MQTT_ERR_PROTOCOL
+
+        if len(message._topic) > 0:
+            # Register the mapping. Rebinding an alias to a different topic
+            # is explicitly allowed by the specification.
+            self._in_topic_alias[alias] = message._topic
+        else:
+            topic = self._in_topic_alias.get(alias)
+            if topic is None:
+                self._easy_log(
+                    MQTT_LOG_ERR,
+                    "Received PUBLISH with empty topic referencing unknown Topic Alias %d",
+                    alias,
+                )
+                return MQTTErrorCode.MQTT_ERR_PROTOCOL
+            message.topic = topic
+
+        return MQTTErrorCode.MQTT_ERR_SUCCESS
+
     def _handle_publish(self) -> MQTTErrorCode:
         result = _packet.decode_publish(self._in_packet["command"], self._in_packet["packet"], self._protocol)
         message = MQTTMessage(
@@ -4108,14 +4169,19 @@ class Client:
         message.properties = result.properties
         message.payload = result.payload
 
+        if self._protocol == MQTTv5:
+            rc = self._resolve_topic_alias(message)
+            if rc != MQTTErrorCode.MQTT_ERR_SUCCESS:
+                return rc
+
         # Handle topics with invalid UTF-8
         # This replaces an invalid topic with a message and the hex
         # representation of the topic for logging. When the user attempts to
         # access message.topic in the callback, an exception will be raised.
         try:
-            print_topic = result.topic.decode('utf-8')
+            print_topic = message.topic
         except UnicodeDecodeError:
-            print_topic = f"TOPIC WITH INVALID UTF-8: {result.topic!r}"
+            print_topic = f"TOPIC WITH INVALID UTF-8: {message._topic!r}"
 
         if self._protocol == MQTTv5:
             self._easy_log(
