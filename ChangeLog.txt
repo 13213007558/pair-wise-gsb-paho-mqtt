@@ -18,6 +18,13 @@ v2.2.0 - 2026-11-xx
 - Various reinforcement against corrupted or malformed packets (Closes #900, #970, #955, #965, #964, #860)
 - Expose ReasonCode names as documentation said (PR #913)
 - Fix broken `reinitialise()` (Closes #824)
+- Enforce MQTT v5.0 Maximum Packet Size on both directions: the broker limit
+  from CONNACK bounds outgoing packets (full control packet, including
+  properties and Remaining Length encoding) and the client limit from CONNECT
+  bounds incoming packets. Oversized outgoing publishes fail with
+  `MQTT_ERR_PAYLOAD_SIZE` without disturbing later packet identifiers or
+  acknowledgements; oversized incoming lengths are rejected before any body
+  buffer is allocated.
 
 v2.1.0 - 2024-04-29
 ===================

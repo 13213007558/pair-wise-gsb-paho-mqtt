@@ -311,7 +311,7 @@ def error_string(mqtt_errno: MQTTErrorCode | int) -> str:
     elif mqtt_errno == MQTT_ERR_TLS:
         return "A TLS error occurred."
     elif mqtt_errno == MQTT_ERR_PAYLOAD_SIZE:
-        return "Payload too large."
+        return "Payload/packet too large."
     elif mqtt_errno == MQTT_ERR_NOT_SUPPORTED:
         return "This feature is not supported."
     elif mqtt_errno == MQTT_ERR_AUTH:
@@ -817,6 +817,13 @@ class Client:
         self._max_inflight_messages = 20
         self._inflight_messages = 0
         self._max_queued_messages = 0
+        # MQTT v5.0 Maximum Packet Size (3.1.2.11.4). The two limits must not
+        # be mixed: _server_max_packet_size bounds what we may send to the
+        # broker (announced by the broker in CONNACK), while
+        # _client_max_packet_size bounds what we are willing to receive
+        # (announced by us in CONNECT). None means no limit is in force.
+        self._server_max_packet_size: int | None = None
+        self._client_max_packet_size: int | None = None
         self._connect_properties: Properties | None = None
         self._will_properties: Properties | None = None
         self._will = False
@@ -1518,6 +1525,14 @@ class Client:
         self._bind_port = bind_port
         self._clean_start = clean_start
         self._connect_properties = properties
+        # MQTT 5.0 3.1.2.11.4: the Maximum Packet Size we put in CONNECT tells
+        # the broker which packets we are willing to receive. It is unrelated
+        # to the server's outbound limit learned from CONNACK.
+        if self._protocol == MQTTv5 and properties is not None \
+                and hasattr(properties, "MaximumPacketSize"):
+            self._client_max_packet_size = properties.MaximumPacketSize
+        else:
+            self._client_max_packet_size = None
         self._state = _ConnectionState.MQTT_CS_CONNECT_ASYNC
 
     def reconnect_delay_set(self, min_delay: int = 1, max_delay: int = 120) -> None:
@@ -1744,10 +1759,13 @@ class Client:
         the old construct of ``(rc, mid) = client.publish(...)`` is still valid.
 
         rc is MQTT_ERR_SUCCESS to indicate success or MQTT_ERR_NO_CONN if the
-        client is not currently connected.  mid is the message ID for the
-        publish request. The mid value can be used to track the publish request
-        by checking against the mid argument in the on_publish() callback if it
-        is defined.
+        client is not currently connected. With MQTT v5.0, rc is
+        MQTT_ERR_PAYLOAD_SIZE when the complete packet would exceed the
+        Maximum Packet Size the broker announced in CONNACK; the packet is not
+        sent in that case and, for QoS>0, its packet identifier is released for
+        reuse. mid is the message ID for the publish request. The mid value can
+        be used to track the publish request by checking against the mid
+        argument in the on_publish() callback if it is defined.
 
         :raises ValueError: if topic is None, has zero length or is
             invalid (contains a wildcard), except if the MQTT version used is v5.0.
@@ -1811,6 +1829,12 @@ class Client:
                     if rc == MQTTErrorCode.MQTT_ERR_NO_CONN:
                         self._inflight_messages -= 1
                         message.state = mqtt_ms_publish
+                    elif rc == MQTTErrorCode.MQTT_ERR_PAYLOAD_SIZE:
+                        # The packet exceeds the broker's Maximum Packet Size
+                        # and was never queued. Drop it without an ack so its
+                        # packet identifier stays free for later messages.
+                        self._inflight_messages -= 1
+                        self._out_messages.pop(message.mid, None)
 
                     message.info.rc = rc
                     return message.info
@@ -3120,6 +3144,29 @@ class Client:
             self._in_packet['have_remaining'] = 1
             self._in_packet['to_process'] = self._in_packet['remaining_length']
 
+            # MQTT 5.0 3.1.2.11.4: reject packets larger than the Maximum
+            # Packet Size we announced in CONNECT. The check uses the decoded
+            # Remaining Length only, before any buffer for the body is
+            # allocated, so a malicious peer advertising a huge length cannot
+            # make us reserve the corresponding memory. The complete packet
+            # size also includes the fixed header byte and the Remaining
+            # Length encoding.
+            if self._protocol == MQTTv5 and self._client_max_packet_size is not None:
+                full_packet_size = (
+                    1
+                    + len(self._in_packet['remaining_count'])
+                    + self._in_packet['remaining_length']
+                )
+                if full_packet_size > self._client_max_packet_size:
+                    self._easy_log(
+                        MQTT_LOG_ERR,
+                        "Incoming packet of %d bytes exceeds the client "
+                        "Maximum Packet Size of %d",
+                        full_packet_size,
+                        self._client_max_packet_size,
+                    )
+                    return MQTTErrorCode.MQTT_ERR_PROTOCOL
+
         count = 100 # Don't get stuck in this loop if we have a huge message.
         while self._in_packet['to_process'] > 0:
             try:
@@ -3352,6 +3399,48 @@ class Client:
     def _send_pubcomp(self, mid: int) -> MQTTErrorCode:
         self._easy_log(MQTT_LOG_DEBUG, "Sending PUBCOMP (Mid: %d)", mid)
         return self._send_command_with_mid(PUBCOMP, mid, False)
+
+    def _check_outgoing_packet_size(
+        self, command: int, packet: bytes | bytearray
+    ) -> MQTTErrorCode:
+        """Reject outgoing MQTT v5.0 packets exceeding the broker's limit.
+
+        The bound announced by the server in CONNACK applies to the complete
+        control packet we send: fixed header byte, Remaining Length encoding
+        and the whole variable header/payload, including properties. CONNECT
+        is not checked because the limit is only known once CONNACK has been
+        received.
+        """
+        if self._protocol != MQTTv5 or self._server_max_packet_size is None:
+            return MQTTErrorCode.MQTT_ERR_SUCCESS
+        if (command & 0xF0) == CONNECT:
+            return MQTTErrorCode.MQTT_ERR_SUCCESS
+        if len(packet) > self._server_max_packet_size:
+            self._easy_log(
+                MQTT_LOG_WARNING,
+                "Outgoing packet of %d bytes exceeds the server Maximum "
+                "Packet Size of %d",
+                len(packet),
+                self._server_max_packet_size,
+            )
+            return MQTTErrorCode.MQTT_ERR_PAYLOAD_SIZE
+        return MQTTErrorCode.MQTT_ERR_SUCCESS
+
+    def _fail_oversized_message(
+        self, message: MQTTMessage
+    ) -> None:
+        """Mark an outgoing QoS>0 message as permanently failed.
+
+        The message leaves the inflight set and the outgoing message store so
+        its packet identifier can be reused, but no PUBACK/PUBREC/PUBCOMP is
+        expected for it. Later valid messages keep their own identifiers and
+        acknowledgement flow untouched.
+        """
+        message.info.rc = MQTTErrorCode.MQTT_ERR_PAYLOAD_SIZE
+        message.info._set_as_published()
+        if message.qos > 0:
+            self._inflight_messages -= 1
+        self._out_messages.pop(message.mid, None)
 
     def _pack_remaining_length(
         self, packet: bytearray, remaining_length: int
@@ -3769,6 +3858,16 @@ class Client:
         qos: int,
         info: MQTTMessageInfo | None = None,
     ) -> MQTTErrorCode:
+        rc = self._check_outgoing_packet_size(command, packet)
+        if rc != MQTTErrorCode.MQTT_ERR_SUCCESS:
+            # Never hand an oversized packet to the broker. The caller is
+            # responsible for the state of any QoS>0 message it owns; the
+            # error code is propagated through MQTTMessageInfo for publish().
+            if info is not None:
+                info.rc = rc
+                info._set_as_published()
+            return rc
+
         mpkt: _OutPacket = {
             "command": command,
             "mid": mid,
@@ -3859,6 +3958,16 @@ class Client:
             # CONNACK, the client must use that value instead of the one
             # it sent (MQTT 5.0 spec 3.2.2.3.14).
             self._keepalive = properties.ServerKeepAlive
+
+        # MQTT 5.0 3.2.2.3.19: the Maximum Packet Size announced by the
+        # server in CONNACK bounds the packets this client may send. Reset
+        # on every connection so a smaller limit after reconnect is honored
+        # and a missing property restores the protocol default of no limit.
+        if self._protocol == MQTTv5:
+            if properties is not None and hasattr(properties, "MaximumPacketSize"):
+                self._server_max_packet_size = properties.MaximumPacketSize
+            else:
+                self._server_max_packet_size = None
 
         if self._protocol == MQTTv311:
             if connack_rc == CONNACK_REFUSED_PROTOCOL_VERSION:
@@ -3968,6 +4077,14 @@ class Client:
                                 m.dup,
                                 properties=m.properties
                             )
+                        if rc == MQTTErrorCode.MQTT_ERR_PAYLOAD_SIZE:
+                            # Queued before the broker's Maximum Packet Size
+                            # was known (or after a smaller limit on
+                            # reconnect): report and drop, then continue.
+                            m.info.rc = rc
+                            m.info._set_as_published()
+                            rc = MQTTErrorCode.MQTT_ERR_SUCCESS
+                            continue
                         if rc != MQTTErrorCode.MQTT_ERR_SUCCESS:
                             return rc
                     elif m.qos == 1:
@@ -3984,6 +4101,10 @@ class Client:
                                     m.dup,
                                     properties=m.properties
                                 )
+                            if rc == MQTTErrorCode.MQTT_ERR_PAYLOAD_SIZE:
+                                self._fail_oversized_message(m)
+                                rc = MQTTErrorCode.MQTT_ERR_SUCCESS
+                                continue
                             if rc != MQTTErrorCode.MQTT_ERR_SUCCESS:
                                 return rc
                     elif m.qos == 2:
@@ -4000,6 +4121,10 @@ class Client:
                                     m.dup,
                                     properties=m.properties
                                 )
+                            if rc == MQTTErrorCode.MQTT_ERR_PAYLOAD_SIZE:
+                                self._fail_oversized_message(m)
+                                rc = MQTTErrorCode.MQTT_ERR_SUCCESS
+                                continue
                             if rc != MQTTErrorCode.MQTT_ERR_SUCCESS:
                                 return rc
                         elif m.state == mqtt_ms_resend_pubrel:
@@ -4229,6 +4354,12 @@ class Client:
                         m.dup,
                         properties=m.properties,
                     )
+                    if rc == MQTTErrorCode.MQTT_ERR_PAYLOAD_SIZE:
+                        # Broker limit shrank (or was first seen after
+                        # reconnect). Drop this message, free the inflight
+                        # slot and keep promoting subsequent queued messages.
+                        self._fail_oversized_message(m)
+                        continue
                     if rc != MQTTErrorCode.MQTT_ERR_SUCCESS:
                         return rc
             else:
