@@ -18,6 +18,12 @@ v2.2.0 - 2026-11-xx
 - Various reinforcement against corrupted or malformed packets (Closes #900, #970, #955, #965, #964, #860)
 - Expose ReasonCode names as documentation said (PR #913)
 - Fix broken `reinitialise()` (Closes #824)
+- Enforce the MQTT v5.0 Message Expiry Interval from the moment an outgoing
+  message enters the local queue, rather than only once it reaches the broker.
+  Messages that expire while queued or disconnected are dropped before being
+  sent, retransmissions carry only the remaining interval, and expired
+  publications settle with the new `MQTT_ERR_MSG_EXPIRED` return code instead
+  of leaving `wait_for_publish()` blocked.
 
 v2.1.0 - 2024-04-29
 ===================
